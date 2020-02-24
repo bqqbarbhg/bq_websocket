@@ -4,6 +4,7 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <stdarg.h>
 
 // -- Config
 
@@ -120,6 +121,12 @@ typedef struct {
 	uint64_t cpu_time_b;
 } bqws_random_entropy;
 
+typedef struct {
+	uint8_t code_be[2];
+	uint8_t magic[4];
+	uint8_t error_be[4];
+} bqws_err_close_data;
+
 // Main socket/context type, passed everywhere as the first argument.
 
 struct bqws_socket {
@@ -147,12 +154,25 @@ struct bqws_socket {
 	void *message_user;
 	bqws_peek_fn *peek_fn;
 	void *peek_user;
+	bqws_log_fn *log_fn;
+	void *log_user;
 	size_t user_size;
 	size_t ping_interval;
+	size_t close_timeout;
+
+	// Pre-allocated error close message storage
+	char error_msg_data[sizeof(bqws_msg_imp) + sizeof(bqws_err_close_data)];
+	bqws_close_reason peer_reason;
+	bqws_error peer_err;
+	bool stop_write;
+	bool stop_read;
+	bool close_sent;
+	bool close_received;
 
 	// Total memory allocated through `allocator` at the moment
 	size_t memory_used;
 	bqws_timestamp last_write_ts;
+	bqws_timestamp start_closing_ts;
 
 	// Message queues
 	size_t recv_partial_size;
@@ -189,13 +209,105 @@ struct bqws_socket {
 // Mark the socket as failed with an error. Only updates the
 // error flag if it's not set.
 
+static void null_free(void *user, void *ptr, size_t size) { }
+
+static void ws_log(bqws_socket *ws, const char *str)
+{
+	if (ws->log_fn) ws->log_fn(ws->log_user, ws, str);
+}
+
+static void ws_log2(bqws_socket *ws, const char *a, const char *b)
+{
+	if (!ws->log_fn) return;
+
+	char line[256];
+	size_t len_a = strlen(a);
+	size_t len_b = strlen(b);
+	bqws_assert(len_a + len_b < sizeof(line));
+
+	char *ptr = line;
+	memcpy(ptr, a, len_a); ptr += len_a;
+	memcpy(ptr, b, len_b); ptr += len_b;
+	*ptr = '\0';
+
+	ws->log_fn(ws->log_user, ws, line);
+}
+
+static void ws_set_closed(bqws_socket *ws)
+{
+	ws_log(ws, "State: CLOSED");
+
+	ws->state = BQWS_STATE_CLOSED;
+	ws->stop_read = true;
+	ws->stop_write = true;
+}
+
 static void ws_fail(bqws_socket *ws, bqws_error err)
 {
 	bqws_assert(err != BQWS_OK);
 	if (!ws->err) {
 		// vvv Breakpoint here to stop on first error
 		ws->err = err;
+
+		ws_log2(ws, "Fail: ", bqws_error_str(err));
+
+		// Try to send an error close message
+		if (ws->state == BQWS_STATE_OPEN && !ws->close_to_send) {
+			bqws_msg_imp *close_msg = (bqws_msg_imp*)ws->error_msg_data;
+			close_msg->magic = BQWS_MSG_MAGIC;
+			close_msg->allocator.free_fn = &null_free;
+			close_msg->owner = ws;
+			close_msg->prev = NULL;
+			close_msg->msg.socket = ws;
+			close_msg->msg.capacity = sizeof(bqws_err_close_data);
+			close_msg->msg.size = sizeof(bqws_err_close_data);
+			close_msg->msg.type = BQWS_MSG_CONTROL_CLOSE;
+
+			bqws_close_reason reason;
+			switch (err) {
+			case BQWS_ERR_LIMIT_MAX_RECV_MSG_SIZE:
+				reason = BQWS_CLOSE_MESSAGE_TOO_BIG;
+				break;
+
+			case BQWS_ERR_BAD_CONTINUATION:
+			case BQWS_ERR_UNFINISHED_PARTIAL:
+			case BQWS_ERR_PARTIAL_CONTROL:
+			case BQWS_ERR_BAD_OPCODE:
+			case BQWS_ERR_RESERVED_BIT:
+				reason = BQWS_CLOSE_PROTOCOL_ERROR;
+				break;
+
+			default:
+				reason = BQWS_CLOSE_SERVER_ERROR;
+				break;
+			}
+
+			bqws_err_close_data *data = (bqws_err_close_data*)close_msg->msg.data;
+			data->code_be[0] = (uint8_t)(reason >> 8);
+			data->code_be[1] = (uint8_t)(reason >> 0);
+			memcpy(data->magic, "BQWS", 4);
+			data->error_be[0] = (uint8_t)(err >> 24);
+			data->error_be[1] = (uint8_t)(err >> 16);
+			data->error_be[2] = (uint8_t)(err >> 8);
+			data->error_be[3] = (uint8_t)(err >> 0);
+
+			ws->close_to_send = close_msg;
+			ws->state = BQWS_STATE_CLOSING;
+			ws->start_closing_ts = bqws_get_timestamp();
+
+		} else if (ws->state == BQWS_STATE_CONNECTING) {
+
+			// If there's an error during connection close
+			// the connection immediately
+			ws_set_closed(ws);
+
+		}
+
 	}
+
+	// IO errors should close their respective channels
+	if (err == BQWS_ERR_IO_READ) ws->stop_read = true;
+	if (err == BQWS_ERR_IO_WRITE) ws->stop_write = true;
 }
 
 static void bqws_sha1(uint8_t digest[20], const void *data, size_t size);
@@ -295,7 +407,9 @@ static void allocator_free(const bqws_allocator *at, void *ptr, size_t size)
 	} else if (at->realloc_fn) {
 		// Use realloc with zero new size
 		at->realloc_fn(at->user, ptr, size, 0);
-	} else if (!at->alloc_fn) {
+	} else {
+		bqws_assert(at->alloc_fn == NULL);
+
 		// Default: free(), only if there is no user defined allocator
 		free(ptr);
 	}
@@ -919,6 +1033,7 @@ static void hs_finish_handshake(bqws_socket *ws)
 {
 	if (ws->err) return;
 
+	ws_log(ws, "State: OPEN");
 	ws->state = BQWS_STATE_OPEN;
 
 	// Free the handshake buffer
@@ -964,8 +1079,48 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 	bqws_msg_imp *msg_to_enqueue = msg;
 
 	if (type == BQWS_MSG_CONTROL_CLOSE) {
-		// Start closing
+
+		// Set peer close reason from the message
+		if (msg->msg.size >= 2) {
+			ws->peer_reason = (bqws_close_reason)(
+				((uint32_t)(uint8_t)msg->msg.data[0] << 8) |
+				((uint32_t)(uint8_t)msg->msg.data[1] << 0) );
+		} else {
+			ws->peer_reason = BQWS_CLOSE_NO_REASON;
+		}
+
+		// Set unknown error if the connection was closed with an error
+		if (ws->peer_reason != BQWS_CLOSE_NORMAL && ws->peer_reason != BQWS_CLOSE_GOING_AWAY) {
+			ws->peer_err = BQWS_ERR_UNKNOWN;
+		}
+
+		// Potentially patch bqws-specific info
+		if (msg->msg.size == sizeof(bqws_err_close_data)) {
+			bqws_err_close_data *data = (bqws_err_close_data*)msg->msg.data;
+			if (!memcmp(data->magic, "BQWS", 4)) {
+				ws->peer_err = (bqws_error)(
+					((uint32_t)(uint8_t)data->error_be[0] << 24) |
+					((uint32_t)(uint8_t)data->error_be[1] << 16) |
+					((uint32_t)(uint8_t)data->error_be[2] <<  8) |
+					((uint32_t)(uint8_t)data->error_be[3] <<  0) );
+			}
+		}
+
+		// Echo the close message back
+		ws->close_to_send = msg;
+
+		// Peer has closed connection so we go directly to CLOSED
+		ws_log(ws, "State: CLOSING (received Close from peer)");
 		ws->state = BQWS_STATE_CLOSING;
+		ws->stop_read = true;
+		ws->close_received = true;
+		if (ws->close_sent) {
+			ws_set_closed(ws);
+		}
+
+		// Don't free the message as it will be re-sent
+		msg = NULL;
+
 	} else if (type == BQWS_MSG_CONTROL_PING) {
 		if (ws->recv_control_messages) {
 			// We want to re-use the PING message to send it back
@@ -1042,6 +1197,11 @@ static bool ws_read_handshake(bqws_socket *ws, bqws_recv_fn recv_fn, void *user)
 		// Read some data
 		size_t to_read = ws->handshake.capacity - ws->handshake.size;
 		size_t num_read = recv_fn(user, ws, ws->handshake.data + ws->handshake.size, to_read);
+		if (num_read == SIZE_MAX) {
+			ws_fail(ws, BQWS_ERR_IO_READ);
+			return false;
+		}
+		bqws_assert(num_read <= to_read);
 		ws->handshake.size += num_read;
 
 		// Scan for \r\n\r\n
@@ -1066,7 +1226,7 @@ static bool ws_read_handshake(bqws_socket *ws, bqws_recv_fn recv_fn, void *user)
 static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn recv_fn, void *user)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	if (ws->err) return false;
+	if (ws->stop_read) return false;
 
 	if (ws->state == BQWS_STATE_CONNECTING) {
 
@@ -1138,6 +1298,12 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 			bqws_assert(buf->offset < 2);
 			size_t to_read = 2 - buf->offset;
 			size_t num_read = recv_fn(user, ws, buf->header + buf->offset, to_read);
+			if (num_read == SIZE_MAX) {
+				ws_fail(ws, BQWS_ERR_IO_READ);
+				return false;
+			}
+			bqws_assert(num_read <= to_read);
+
 			buf->offset += num_read;
 			if (num_read < to_read) return false;
 			if (num_read == SIZE_MAX) {
@@ -1166,6 +1332,12 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 		if (buf->offset < buf->header_size) {
 			size_t to_read = buf->header_size - buf->offset;
 			size_t num_read = recv_fn(user, ws, buf->header + buf->offset, to_read);
+			if (num_read == SIZE_MAX) {
+				ws_fail(ws, BQWS_ERR_IO_READ);
+				return false;
+			}
+			bqws_assert(num_read <= to_read);
+
 			buf->offset += num_read;
 			if (num_read < to_read) return false;
 			if (num_read == SIZE_MAX) {
@@ -1287,6 +1459,12 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 
 		size_t to_read = msg->msg.size - buf->offset;
 		size_t num_read = recv_fn(user, ws, msg->msg.data + buf->offset, to_read);
+		if (num_read == SIZE_MAX) {
+			ws_fail(ws, BQWS_ERR_IO_READ);
+			return false;
+		}
+		bqws_assert(num_read <= to_read);
+
 		buf->offset += num_read;
 		if (num_read < to_read) return false;
 		if (num_read == SIZE_MAX) {
@@ -1303,12 +1481,14 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 
 	// Peek at all incoming messages before processing
 	if (ws->peek_fn) {
-		ws->peek_fn(ws->peek_user, &msg->msg);
+		ws->peek_fn(ws->peek_user, &msg->msg, true);
 	}
 
 	// If we copied the last bytes of the message we can push it
 	// to the queue and clear the buffer.
 	bqws_msg_type type = msg->msg.type;
+
+	ws_log2(ws, "Received: ", bqws_msg_type_str(buf->msg->msg.type));
 
 	if ((type & BQWS_MSG_PARTIAL_BIT) != 0 && !ws->recv_partial_messages) {
 		ws->recv_partial_size += msg->msg.size;
@@ -1386,7 +1566,7 @@ static bool ws_write_handshake(bqws_socket *ws, bqws_send_fn *send_fn, void *use
 static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *send_fn, void *user)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	if (ws->err) return false;
+	if (ws->stop_write) return false;
 
 	if (ws->state == BQWS_STATE_CONNECTING) {
 
@@ -1424,18 +1604,18 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 	}
 
 	if (!buf->msg) {
-		if (ws->state != BQWS_STATE_OPEN) {
-			// Stop sending anything if the state is not open
-			return false;
-		}
-
 		// No message: Send high priority messages first.
-		if (ws->close_to_send) {
+
+		if (ws->close_to_send && !ws->close_sent) {
+			// First priority: Send close message
 			buf->msg = ws->close_to_send;
 			ws->close_to_send = NULL;
 			bqws_assert(buf->msg->msg.type == BQWS_MSG_CONTROL_CLOSE);
-			ws->state = BQWS_STATE_CLOSING;
+		} else if (ws->state != BQWS_STATE_OPEN) {
+			// Stop sending anything if the state is not open
+			return false;
 		} else if (ws->pong_to_send) {
+			// Try to respond to PING messages fast
 			buf->msg = ws->pong_to_send;
 			ws->pong_to_send = NULL;
 			bqws_assert(buf->msg->msg.type == BQWS_MSG_CONTROL_PONG);
@@ -1448,9 +1628,20 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 			}
 			buf->msg = msg;
 		}
+
+		bqws_assert(buf->msg && buf->msg->magic == BQWS_MSG_MAGIC);
+
 	}
 	bqws_msg_imp *msg = buf->msg;
 	bqws_assert(msg && msg->magic == BQWS_MSG_MAGIC);
+
+	// Re-assign the public socket to be this one for the callback
+	msg->msg.socket = ws;
+
+	// Peek at all outgoing messages before processing
+	if (ws->peek_fn) {
+		ws->peek_fn(ws->peek_user, &msg->msg, false);
+	}
 
 	if (ws->ping_interval != SIZE_MAX) {
 		ws->last_write_ts = bqws_get_timestamp();
@@ -1563,6 +1754,16 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 		if (sent < to_send) return false;
 	}
 
+	ws_log2(ws, "Sent: ", bqws_msg_type_str(buf->msg->msg.type));
+
+	// Mark close as been sent
+	if (msg->msg.type == BQWS_MSG_CONTROL_CLOSE) {
+		ws->close_sent = true;
+		if (ws->close_received) {
+			ws_set_closed(ws);
+		}
+	}
+
 	// Delete the message
 	msg_free_owned(ws, msg);
 
@@ -1656,6 +1857,8 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 	ws->message_user = opts->message_user;
 	ws->peek_fn = opts->peek_fn;
 	ws->peek_user = opts->peek_user;
+	ws->log_fn = opts->log_fn;
+	ws->log_user = opts->log_user;
 	ws->user_size = opts->user_size;
 
 	ws_expand_default_limits(&ws->limits);
@@ -1665,6 +1868,8 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 	} else {
 		ws->ping_interval = is_server ? 20000 : 10000;
 	}
+
+	ws->close_timeout = opts->close_timeout ? opts->close_timeout : 5000;
 
 	bqws_assert(ws->ping_interval > 0);
 	if (ws->ping_interval != SIZE_MAX) {
@@ -1683,7 +1888,10 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 	if (opts->name) ws->name = ws_copy_str(ws, opts->name);
 
 	if (opts->skip_handshake) {
+		ws_log(ws, "State: OPEN (skip handhake)");
 		ws->state = BQWS_STATE_OPEN;
+	} else {
+		ws_log(ws, "State: CONNECTING");
 	}
 
 	if (ws->err) {
@@ -1771,19 +1979,31 @@ bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *serv
 	return ws;
 }
 
-void bqws_start_closing(bqws_socket *ws)
+void bqws_start_closing(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	bqws_assert(size == 0 || data);
 	if (ws->err) return;
 	if (ws->close_to_send) return;
 	if (ws->state >= BQWS_STATE_CLOSING) return;
 
-	ws->close_to_send = msg_alloc(ws, BQWS_MSG_CONTROL_CLOSE, 0);
+	bqws_msg_imp *imp = msg_alloc(ws, BQWS_MSG_CONTROL_CLOSE, size + 2);
+	if (!imp) return;
+
+	imp->msg.data[0] = (uint8_t)(reason >> 8);
+	imp->msg.data[1] = (uint8_t)(reason & 0xff);
+	memcpy(imp->msg.data + 2, data, size);
+	ws->close_to_send = imp;
+	ws->start_closing_ts = bqws_get_timestamp();
+
+	ws_log(ws, "State: CLOSING (user close)");
 }
 
 void bqws_free_socket(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+
+	ws_log(ws, "Freed");
 
 	// Free everything, as the socket may have errored it can
 	// be in almost any state
@@ -1867,6 +2087,12 @@ bqws_error bqws_get_error(const bqws_socket *ws)
 	return ws->err;
 }
 
+bool bqws_is_closed(const bqws_socket *ws)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	return ws->state == BQWS_STATE_CLOSED;
+}
+
 size_t bqws_get_memory_used(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
@@ -1895,6 +2121,18 @@ const char *bqws_get_name(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	return ws->name;
+}
+
+bqws_close_reason bqws_get_peer_close_reason(const bqws_socket *ws)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	return ws->peer_reason;
+}
+
+bqws_error bqws_get_peer_error(const bqws_socket *ws)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	return ws->peer_err;
 }
 
 const char *bqws_get_protocol(const bqws_socket *ws)
@@ -2105,9 +2343,19 @@ void bqws_update_state(bqws_socket *ws)
 				bqws_send_ping(ws, NULL, 0);
 			}
 		}
-	}
 
-	// TODO: Send Pings/Pongs to keep the connection alive
+	} else if (ws->state == BQWS_STATE_CLOSING) {
+
+		// Close timeout
+		if (ws->ping_interval != SIZE_MAX) {
+			bqws_timestamp time = bqws_get_timestamp();
+			size_t delta = bqws_timestamp_delta_to_ms(ws->last_write_ts, time);
+			if (delta > ws->close_timeout) {
+				ws_set_closed(ws);
+			}
+		}
+
+	}
 
 }
 
@@ -2163,6 +2411,50 @@ size_t bqws_write_to(bqws_socket *ws, void *data, size_t size)
 	}
 
 	return s.ptr - (char*)data;
+}
+
+const char *bqws_error_str(bqws_error error)
+{
+	switch (error) {
+	case BQWS_OK: return "OK";
+	case BQWS_ERR_UNKNOWN: return "UNKNOWN";
+	case BQWS_ERR_SERVER_REJECT: return "SERVER_REJECT";
+	case BQWS_ERR_LIMIT_MAX_MEMORY_USED: return "LIMIT_MAX_MEMORY_USED";
+	case BQWS_ERR_LIMIT_MAX_RECV_MSG_SIZE: return "LIMIT_MAX_RECV_MSG_SIZE";
+	case BQWS_ERR_LIMIT_MAX_HANDSHAKE_SIZE: return "LIMIT_MAX_HANDSHAKE_SIZE";
+	case BQWS_ERR_ALLOCATOR: return "ALLOCATOR";
+	case BQWS_ERR_BAD_CONTINUATION: return "BAD_CONTINUATION";
+	case BQWS_ERR_UNFINISHED_PARTIAL: return "UNFINISHED_PARTIAL";
+	case BQWS_ERR_PARTIAL_CONTROL: return "PARTIAL_CONTROL";
+	case BQWS_ERR_BAD_OPCODE: return "BAD_OPCODE";
+	case BQWS_ERR_RESERVED_BIT: return "RESERVED_BIT";
+	case BQWS_ERR_IO_WRITE: return "IO_WRITE";
+	case BQWS_ERR_IO_READ: return "IO_READ";
+	case BQWS_ERR_BAD_HANDSHAKE: return "BAD_HANDSHAKE";
+	case BQWS_ERR_UNSUPPORTED_VERSION: return "UNSUPPORTED_VERSION";
+	case BQWS_ERR_TOO_MANY_HEADERS: return "TOO_MANY_HEADERS";
+	case BQWS_ERR_TOO_MANY_PROTOCOLS: return "TOO_MANY_PROTOCOLS";
+	case BQWS_ERR_HEADER_KEY_TOO_LONG: return "HEADER_KEY_TOO_LONG";
+	case BQWS_ERR_HEADER_BAD_ACCEPT: return "HEADER_BAD_ACCEPT";
+	case BQWS_ERR_HEADER_PARSE: return "HEADER_PARSE";
+	default: return "(unknown)";
+	}
+}
+
+const char *bqws_msg_type_str(bqws_msg_type type)
+{
+	switch (type) {
+	case BQWS_MSG_TEXT: return "TEXT";
+	case BQWS_MSG_BINARY: return "BINARY";
+	case BQWS_MSG_PARTIAL_TEXT: return "PARTIAL_TEXT";
+	case BQWS_MSG_PARTIAL_BINARY: return "PARTIAL_BINARY";
+	case BQWS_MSG_FINAL_TEXT: return "FINAL_TEXT";
+	case BQWS_MSG_FINAL_BINARY: return "FINAL_BINARY";
+	case BQWS_MSG_CONTROL_CLOSE: return "CONTROL_CLOSE";
+	case BQWS_MSG_CONTROL_PING: return "CONTROL_PING";
+	case BQWS_MSG_CONTROL_PONG: return "CONTROL_PONG";
+	default: return "(unknown)";
+	}
 }
 
 // TODO: Add define for this

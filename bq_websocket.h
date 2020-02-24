@@ -10,6 +10,9 @@ typedef struct bqws_socket bqws_socket;
 typedef enum bqws_error {
 	BQWS_OK = 0,
 
+	// Unknown error from non-BQWS peer
+	BQWS_ERR_UNKNOWN,
+
 	// Rejected with `bqws_server_reject()`
 	BQWS_ERR_SERVER_REJECT,
 
@@ -43,6 +46,22 @@ typedef enum bqws_state {
 	BQWS_STATE_CLOSING,
 	BQWS_STATE_CLOSED,
 } bqws_state;
+
+typedef enum bqws_close_reason {
+	BQWS_CLOSE_INVALID = 0,
+
+	BQWS_CLOSE_NORMAL            = 1000,
+	BQWS_CLOSE_GOING_AWAY        = 1001,
+	BQWS_CLOSE_PROTOCOL_ERROR    = 1002,
+	BQWS_CLOSE_UNSUPPORTED_TYPE  = 1003,
+	BQWS_CLOSE_NO_REASON         = 1005,
+	BQWS_CLOSE_ABNORMAL          = 1006,
+	BQWS_CLOSE_BAD_DATA          = 1007,
+	BQWS_CLOSE_GENERIC_ERROR     = 1008,
+	BQWS_CLOSE_MESSAGE_TOO_BIG   = 1009,
+	BQWS_CLOSE_EXTENSION_MISSING = 1010,
+	BQWS_CLOSE_SERVER_ERROR      = 1011,
+} bqws_close_reason;
 
 typedef enum bqws_msg_type {
 
@@ -95,13 +114,14 @@ typedef struct bqws_msg {
 
 typedef void *bqws_alloc_fn(void *user, size_t size);
 typedef void *bqws_realloc_fn(void *user, void *ptr, size_t old_size, size_t new_size);
-typedef void *bqws_free_fn(void *user, void *ptr, size_t size);
+typedef void bqws_free_fn(void *user, void *ptr, size_t size);
 
 typedef size_t bqws_send_fn(void *user, bqws_socket *ws, const void *data, size_t size);
 typedef size_t bqws_recv_fn(void *user, bqws_socket *ws, void *data, size_t size);
 
 typedef bool bqws_message_fn(void *user, bqws_msg *msg);
-typedef void bqws_peek_fn(void *user, bqws_msg *msg);
+typedef void bqws_peek_fn(void *user, bqws_msg *msg, bool received);
+typedef void bqws_log_fn(void *user, bqws_socket *ws, const char *line);
 
 typedef struct bqws_allocator {
 	void *user;
@@ -146,14 +166,25 @@ typedef struct bqws_opts {
 	bqws_peek_fn *peek_fn;
 	void *peek_user;
 
+	// Verbose log of all events for this socket
+	bqws_log_fn *log_fn;
+	void *log_user;
+
 	// User data block, if `user_size > 0` but `user_data == NULL`
 	// the data will be zero-initialized
 	void *user_data;
 	size_t user_size;
 
-	// How often to send PING messages if there is no traffic, use SIZE_MAX to disable
+	// How often (milliseconds) to send PING messages if there is no traffic,
+	// use SIZE_MAX to disable automatic PING
 	// default: server: 20000, client: 10000
 	size_t ping_interval;
+
+	// How long to wait for the close response before forcing the
+	// state to be BQWS_STATE_CLOSED. Use SIZE_MAX to disable
+	// the close timeout.
+	// default: 5000
+	size_t close_timeout;
 
 	// Name for the socket for debugging
 	const char *name;
@@ -221,7 +252,7 @@ typedef struct bqws_server_opts {
 
 bqws_socket *bqws_new_client(const bqws_opts *opts, const bqws_client_opts *client_opts);
 bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *server_opts);
-void bqws_start_closing(bqws_socket *ws);
+void bqws_start_closing(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size);
 void bqws_free_socket(bqws_socket *ws);
 
 // -- Server connect
@@ -236,11 +267,16 @@ void bqws_server_reject(bqws_socket *ws);
 
 bqws_state bqws_get_state(const bqws_socket *ws);
 bqws_error bqws_get_error(const bqws_socket *ws);
+bool bqws_is_closed(const bqws_socket *ws);
 size_t bqws_get_memory_used(const bqws_socket *ws);
 bool bqws_is_server(const bqws_socket *ws);
 void *bqws_user_data(const bqws_socket *ws);
 size_t bqws_user_data_size(const bqws_socket *ws);
 const char *bqws_get_name(const bqws_socket *ws);
+
+// Peer closing
+bqws_close_reason bqws_get_peer_close_reason(const bqws_socket *ws);
+bqws_error bqws_get_peer_error(const bqws_socket *ws);
 
 // Get the chosen protocol, returns "" if none chosen but the connection is open
 // Returns NULL if the connection is not established
@@ -280,5 +316,10 @@ void bqws_update_io(bqws_socket *ws);
 // Manual IO
 size_t bqws_read_from(bqws_socket *ws, const void *data, size_t size);
 size_t bqws_write_to(bqws_socket *ws, void *data, size_t size);
+
+// -- Debugging
+
+const char *bqws_error_str(bqws_error error);
+const char *bqws_msg_type_str(bqws_msg_type type);
 
 #endif
