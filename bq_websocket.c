@@ -56,6 +56,10 @@ typedef struct bqws_msg_imp bqws_msg_imp;
 struct bqws_msg_imp {
 	uint32_t magic; // = BQWS_MSG_MAGIC
 
+	// Socket that is responsible of freeing this message
+	// or NULL if it's owned by the user.
+	bqws_socket *owner;
+
 	// Allocator used to allocate this message
 	bqws_allocator allocator;
 
@@ -310,6 +314,7 @@ static void *ws_alloc(bqws_socket *ws, size_t size)
 
 	void *ptr = allocator_alloc(&ws->allocator, size);
 	if (!ptr) ws_fail(ws, BQWS_ERR_ALLOCATOR);
+
 	return ptr;
 }
 
@@ -326,6 +331,7 @@ static void *ws_realloc(bqws_socket *ws, void *ptr, size_t old_size, size_t new_
 
 	void *new_ptr = allocator_realloc(&ws->allocator, ptr, old_size, new_size);
 	if (!new_ptr) ws_fail(ws, BQWS_ERR_ALLOCATOR);
+
 	return new_ptr;
 }
 
@@ -333,6 +339,7 @@ static void ws_free(bqws_socket *ws, void *ptr, size_t size)
 {
 	bqws_assert(ws->memory_used >= size);
 	ws->memory_used -= size;
+
 	allocator_free(&ws->allocator, ptr, size);
 }
 
@@ -365,6 +372,7 @@ static bqws_msg_imp *msg_alloc(bqws_socket *ws, bqws_msg_type type, size_t size)
 	if (!msg) return NULL;
 
 	msg->magic = BQWS_MSG_MAGIC;
+	msg->owner = ws;
 	msg->allocator = ws->allocator;
 	msg->prev = NULL;
 	msg->msg.socket = ws;
@@ -377,6 +385,51 @@ static bqws_msg_imp *msg_alloc(bqws_socket *ws, bqws_msg_type type, size_t size)
 	}
 
 	return msg;
+}
+
+static void msg_release_ownership(bqws_socket *ws, bqws_msg_imp *msg)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	bqws_assert(msg && msg->magic == BQWS_MSG_MAGIC);
+	bqws_assert(msg->owner == ws);
+
+	ws->memory_used -= msg_alloc_size(&msg->msg);
+	msg->owner = NULL;
+}
+
+static bool msg_acquire_ownership(bqws_socket *ws, bqws_msg_imp *msg)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	bqws_assert(msg && msg->magic == BQWS_MSG_MAGIC);
+	bqws_assert(msg->owner == NULL);
+
+	size_t size = msg_alloc_size(&msg->msg);
+	if (size > ws->limits.max_memory_used - ws->memory_used) {
+		ws_fail(ws, BQWS_ERR_LIMIT_MAX_MEMORY_USED);
+		return false;
+	}
+
+	ws->memory_used += size;
+	msg->owner = ws;
+
+	return true;
+}
+
+static void msg_free_owned(bqws_socket *ws, bqws_msg_imp *msg)
+{
+	if (!msg) return;
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	bqws_assert(msg->magic == BQWS_MSG_MAGIC);
+	bqws_assert(msg->owner == ws);
+
+	msg->magic = BQWS_DELETED_MAGIC;
+	msg->owner = NULL;
+
+	size_t size = msg_alloc_size(&msg->msg);
+	ws->memory_used -= size;
+
+	bqws_allocator at = msg->allocator;
+	allocator_free(&at, msg, size);
 }
 
 // TODO: Make these operations thread-safe / atomic
@@ -424,9 +477,7 @@ static void msg_free_queue(bqws_socket *ws, bqws_msg_queue *mq)
 {
 	bqws_msg_imp *imp;
 	while ((imp = msg_dequeue(mq)) != 0) {
-		bqws_assert(ws->memory_used >= msg_alloc_size(&imp->msg));
-		ws->memory_used -= msg_alloc_size(&imp->msg);
-		bqws_free_msg(&imp->msg);
+		msg_free_owned(ws, imp);
 	}
 }
 
@@ -434,13 +485,14 @@ static void msg_free_queue(bqws_socket *ws, bqws_msg_queue *mq)
 
 static uint32_t mask_make_key(bqws_socket *ws)
 {
+	// https://nullprogram.com/blog/2018/07/31/
 	uint64_t x = bqws_cpu_time();
 
-    x ^= x >> 32;
-    x *= UINT64_C(0xd6e8feb86659fd93);
-    x ^= x >> 32;
-    x *= UINT64_C(0xd6e8feb86659fd93);
-    x ^= x >> 32;
+	x ^= x >> 32;
+	x *= UINT64_C(0xd6e8feb86659fd93);
+	x ^= x >> 32;
+	x *= UINT64_C(0xd6e8feb86659fd93);
+	x ^= x >> 32;
 
 	return (uint32_t)x;
 }
@@ -607,7 +659,7 @@ static void hs_client_handshake(bqws_socket *ws, const bqws_client_opts *opts)
 	bqws_random_entropy entropy;
 	entropy.cpu_time_a = bqws_cpu_time();
 	entropy.clock = clock();
-	entropy.time = clock();
+	entropy.time = time(NULL);
 	entropy.function_pointer = &hs_client_handshake;
 	entropy.stack_pointer = &entropy;
 	entropy.heap_pointer = ws;
@@ -897,12 +949,10 @@ static void ws_enqueue_recv(bqws_socket *ws, bqws_msg_imp *msg)
 
 	// If the user callback returns true the message won't be
 	// enqueued to the receive queue.
-	if (ws->message_fn && ws->message_fn(ws->message_user, &msg->msg)) {
-		// If the user callback took ownership of the message
-		// remove it's size from the memory counter.
-		bqws_assert(ws->memory_used >= msg_memory_size);
-		ws->memory_used -= msg_memory_size;
-		return;
+	if (ws->message_fn) {
+		msg_release_ownership(ws, msg);
+		if (ws->message_fn(ws->message_user, &msg->msg)) return;
+		if (!msg_acquire_ownership(ws, msg)) return;
 	}
 
 	msg_enqueue(&ws->recv_queue, msg);
@@ -931,9 +981,12 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 
 		// Only retain the latest PONG to send back
 		if (ws->pong_to_send) {
-			bqws_free_msg(&ws->pong_to_send->msg);
+			msg_free_owned(ws, ws->pong_to_send);
 		}
 		ws->pong_to_send = msg;
+
+		// Don't free the message as it will be re-sent
+		msg = NULL;
 
 	} else if (type == BQWS_MSG_CONTROL_PONG) {
 		// PONG messages don't require any kind of handling
@@ -944,6 +997,8 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 	// Receive control messages
 	if (ws->recv_control_messages) {
 		ws_enqueue_recv(ws, msg_to_enqueue);
+	} else if (msg) {
+		msg_free_owned(ws, msg);
 	}
 }
 
@@ -1278,18 +1333,14 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 				memcpy(combined->msg.data + offset, part->msg.data, part->msg.size);
 				offset += part->msg.size;
 
-				// Delete the part (and remove it's memory contribution)
-				bqws_assert(ws->memory_used >= msg_alloc_size(&msg->msg));
-				ws->memory_used -= msg_alloc_size(&part->msg);
-				bqws_free_msg(&part->msg);
+				// Delete the part
+				msg_free_owned(ws, part);
 			}
 
 			// Final part
 			memcpy(combined->msg.data + offset, msg->msg.data, msg->msg.size);
 			offset += msg->msg.size;
-			bqws_assert(ws->memory_used >= msg_alloc_size(&msg->msg));
-			ws->memory_used -= msg_alloc_size(&msg->msg);
-			bqws_free_msg(&msg->msg);
+			msg_free_owned(ws, msg);
 
 			bqws_assert(offset == combined->msg.size);
 
@@ -1513,9 +1564,7 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 	}
 
 	// Delete the message
-	bqws_assert(ws->memory_used >= msg_alloc_size(&msg->msg));
-	ws->memory_used -= msg_alloc_size(&msg->msg);
-	bqws_free_msg(&msg->msg);
+	msg_free_owned(ws, msg);
 
 	// Sent everything, clear status
 	buf->offset = 0;
@@ -1743,15 +1792,15 @@ void bqws_free_socket(bqws_socket *ws)
 	msg_free_queue(ws, &ws->recv_queue);
 	msg_free_queue(ws, &ws->recv_partial_queue);
 	msg_free_queue(ws, &ws->send_queue);
-	if (ws->pong_to_send) bqws_free_msg(&ws->pong_to_send->msg);
-	if (ws->close_to_send) bqws_free_msg(&ws->close_to_send->msg);
+	if (ws->pong_to_send) msg_free_owned(ws, ws->pong_to_send);
+	if (ws->close_to_send) msg_free_owned(ws, ws->close_to_send);
 
 	// Read/write buffers
 	ws_free(ws, ws->handshake.data, ws->handshake.capacity);
 	ws_free(ws, ws->handshake_overflow.data, ws->handshake_overflow.capacity);
-	if (ws->recv_buf.msg) bqws_free_msg(&ws->recv_buf.msg->msg);
-	if (ws->send_buf.msg) bqws_free_msg(&ws->send_buf.msg->msg);
-	if (ws->next_partial_to_send) bqws_free_msg(&ws->next_partial_to_send->msg);
+	if (ws->recv_buf.msg) msg_free_owned(ws, ws->recv_buf.msg);
+	if (ws->send_buf.msg) msg_free_owned(ws, ws->send_buf.msg);
+	if (ws->next_partial_to_send) msg_free_owned(ws, ws->next_partial_to_send);
 
 	// Misc buffers
 	if (ws->client_key_base64) ws_free(ws, ws->client_key_base64, CLIENT_KEY_BASE64_MAX_SIZE);
@@ -1866,9 +1915,7 @@ bqws_msg *bqws_recv(bqws_socket *ws)
 	if (!imp) return NULL;
 	bqws_assert(imp->magic == BQWS_MSG_MAGIC);
 
-	// Remove used memory as it now belongs to the user
-	bqws_assert(ws->memory_used >= msg_alloc_size(&imp->msg));
-	ws->memory_used -= msg_alloc_size(&imp->msg);
+	msg_release_ownership(ws, imp);
 	return &imp->msg;
 }
 
@@ -1878,6 +1925,7 @@ void bqws_free_msg(bqws_msg *msg)
 
 	bqws_msg_imp *imp = msg_imp(msg);
 	bqws_assert(imp->magic == BQWS_MSG_MAGIC);
+	bqws_assert(imp->owner == NULL);
 
 	imp->magic = BQWS_DELETED_MAGIC;
 
@@ -1923,9 +1971,7 @@ bqws_msg *bqws_allocate_msg(bqws_socket *ws, bqws_msg_type type, size_t size)
 	bqws_msg_imp *imp = msg_alloc(ws, type, size);
 	if (!imp) return NULL;
 
-	// Remove used memory as it now belongs to the user
-	bqws_assert(ws->memory_used >= msg_alloc_size(&imp->msg));
-	ws->memory_used -= msg_alloc_size(&imp->msg);
+	msg_release_ownership(ws, imp);
 	return &imp->msg;
 }
 
@@ -1933,21 +1979,15 @@ void bqws_send_msg(bqws_socket *ws, bqws_msg *msg)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	bqws_assert(msg->type == BQWS_MSG_TEXT || msg->type == BQWS_MSG_BINARY);
+	bqws_assert(msg->size <= msg->capacity);
 
 	bqws_msg_imp *imp = msg_imp(msg);
 	bqws_assert(imp && imp->magic == BQWS_MSG_MAGIC);
 
 	if (ws->err) return;
 
-	// Count the messages size towards the total memory count
-	size_t msg_size = msg_alloc_size(msg);
-	if (msg_size > ws->limits.max_memory_used - ws->memory_used) {
-		ws_fail(ws, BQWS_ERR_LIMIT_MAX_MEMORY_USED);
-		return;
-	}
-	ws->memory_used += msg_size;
+	if (!msg_acquire_ownership(ws, imp)) return;
 
-	bqws_assert(msg->size <= msg->capacity);
 	msg_enqueue(&ws->send_queue, imp);
 }
 
@@ -1994,16 +2034,11 @@ void bqws_send_append_msg(bqws_socket *ws, bqws_msg *msg)
 		msg_enqueue(&ws->send_queue, ws->next_partial_to_send);
 	}
 
-	// Count the messages size towards the total memory count
-	size_t msg_size = msg_alloc_size(msg);
-	if (msg_size > ws->limits.max_memory_used - ws->memory_used) {
-		ws_fail(ws, BQWS_ERR_LIMIT_MAX_MEMORY_USED);
-		return;
-	}
-	ws->memory_used += msg_size;
+	bqws_msg_imp *imp = msg_imp(msg);
+	if (!msg_acquire_ownership(ws, imp)) return;
 
 	msg->type = ws->send_partial_type | BQWS_MSG_PARTIAL_BIT;
-	ws->next_partial_to_send = msg_imp(msg);
+	ws->next_partial_to_send = imp;
 }
 
 void bqws_send_finish(bqws_socket *ws)
