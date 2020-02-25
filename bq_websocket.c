@@ -248,8 +248,9 @@ struct bqws_socket {
 		char *client_key_base64;
 		bool client_handshake_done;
 
-		// Write/read buffers
-		char recv_header[256];
+		// Write/read buffers `recv_header` is also used to buffer
+		// multiple small messages
+		char recv_header[512];
 		bqws_msg_buffer recv_buf;
 		char send_header[16];
 		bqws_msg_buffer send_buf;
@@ -408,12 +409,12 @@ static size_t mem_stream_send(void *user, bqws_socket *ws, const void *data, siz
 	return to_copy;
 }
 
-static size_t mem_stream_recv(void *user, bqws_socket *ws, void *data, size_t size)
+static size_t mem_stream_recv(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size)
 {
 	// Copy as many bytes as fit in the stream
 	bqws_mem_stream *s = (bqws_mem_stream*)user;
 	size_t left = s->end - s->ptr;
-	size_t to_copy = size;
+	size_t to_copy = max_size;
 	if (to_copy > left) to_copy = left;
 	memcpy(data, s->ptr, to_copy);
 	s->ptr += to_copy;
@@ -1213,6 +1214,15 @@ static void hs_store_handshake_overflow(bqws_socket *ws)
 
 // Control messages
 
+static void ws_enqueue_send(bqws_socket *ws, bqws_msg_imp *msg)
+{
+	if (ws->user_io.notify_fn) {
+		ws->user_io.notify_fn(ws->user_io.user, ws);
+	}
+
+	msg_enqueue(&ws->send_queue, msg);
+}
+
 static void ws_enqueue_recv(bqws_socket *ws, bqws_msg_imp *msg)
 {
 	size_t msg_memory_size = msg_alloc_size(&msg->msg);
@@ -1221,7 +1231,7 @@ static void ws_enqueue_recv(bqws_socket *ws, bqws_msg_imp *msg)
 	// enqueued to the receive queue.
 	if (ws->message_fn) {
 		msg_release_ownership(ws, msg);
-		if (ws->message_fn(ws->message_user, &msg->msg)) return;
+		if (ws->message_fn(ws->message_user, ws, &msg->msg)) return;
 		if (!msg_acquire_ownership(ws, msg)) return;
 	}
 
@@ -1325,14 +1335,14 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 // Read data into a buffer, returns amount of bytes used read.
 // Returns 0 and sets `ws->err` if parsing fails.
 
-static size_t ws_recv_from_handshake_overflow(void *user, bqws_socket *ws, void *data, size_t size)
+static size_t ws_recv_from_handshake_overflow(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	bqws_assert_locked(&ws->io.mutex);
 
 	size_t offset = ws->io.handshake_overflow.read_offset;
 	size_t left = ws->io.handshake_overflow.size - offset;
-	size_t to_copy = size;
+	size_t to_copy = max_size;
 	if (to_copy > left) to_copy = left;
 	memcpy(data, ws->io.handshake_overflow.data + offset, to_copy);
 	ws->io.handshake_overflow.read_offset += to_copy;
@@ -1360,9 +1370,12 @@ static bool ws_read_handshake(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *us
 			ws->io.handshake.capacity = new_cap;
 		}
 
+		// TODO: min_size can be up to 4 depending on the suffix of the buffer
+
 		// Read some data
 		size_t to_read = ws->io.handshake.capacity - ws->io.handshake.size;
-		size_t num_read = recv_fn(user, ws, ws->io.handshake.data + ws->io.handshake.size, to_read);
+		size_t num_read = recv_fn(user, ws, ws->io.handshake.data + ws->io.handshake.size, to_read, 1);
+		if (num_read == 0) return false;
 		if (num_read == SIZE_MAX) {
 			ws_fail(ws, BQWS_ERR_IO_READ);
 			return false;
@@ -1424,6 +1437,11 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 					// remaining data to be read later
 					hs_store_handshake_overflow(ws);
 					ws->io.handshake.size = 0;
+
+					// Notify IO that there is a handshake to send
+					if (ws->user_io.notify_fn) {
+						ws->user_io.notify_fn(ws->user_io.user, ws);
+					}
 				}
 			}
 
@@ -1470,19 +1488,22 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 	// Header has not been parsed yet
 	if (!buf->msg) {
 
-		size_t to_read = sizeof(ws->io.recv_header) - buf->header_offset;
-		size_t num_read = recv_fn(user, ws, ws->io.recv_header + buf->header_offset, to_read);
-		if (num_read == SIZE_MAX) {
-			ws_fail(ws, BQWS_ERR_IO_READ);
-			return false;
-		}
-		bqws_assert(num_read <= to_read);
-
-		buf->header_offset += num_read;
-
 		// We need to read at least two bytes to determine
 		// the header size
 		if (buf->header_size == 0) {
+			if (buf->header_offset < 2) {
+				size_t to_read = sizeof(ws->io.recv_header) - buf->header_offset;
+				size_t min_read = 2 - buf->header_offset;
+				size_t num_read = recv_fn(user, ws, ws->io.recv_header + buf->header_offset, to_read, min_read);
+				if (num_read == 0) return false;
+				if (num_read == SIZE_MAX) {
+					ws_fail(ws, BQWS_ERR_IO_READ);
+					return false;
+				}
+				bqws_assert(num_read <= to_read);
+				buf->header_offset += num_read;
+			}
+
 			if (buf->header_offset < 2) return false;
 
 			uint8_t mask_len = ws->io.recv_header[1];
@@ -1500,6 +1521,21 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 
 			buf->header_size = header_size;
 			bqws_assert(buf->header_size <= sizeof(ws->io.recv_header));
+		}
+
+		// Read more header data if we need it
+		if (buf->header_offset < buf->header_size) {
+			size_t to_read = sizeof(ws->io.recv_header) - buf->header_offset;
+			size_t min_read = buf->header_size - buf->header_offset;
+			size_t num_read = recv_fn(user, ws, ws->io.recv_header + buf->header_offset, to_read, min_read);
+			if (num_read == 0) return false;
+			if (num_read == SIZE_MAX) {
+				ws_fail(ws, BQWS_ERR_IO_READ);
+				return false;
+			}
+			bqws_assert(num_read <= to_read);
+			buf->header_offset += num_read;
+			return false;
 		}
 
 		if (buf->header_offset < buf->header_size) return false;
@@ -1634,7 +1670,8 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 	if (msg->msg.size > 0 && buf->offset < msg->msg.size) {
 
 		size_t to_read = msg->msg.size - buf->offset;
-		size_t num_read = recv_fn(user, ws, msg->msg.data + buf->offset, to_read);
+		size_t num_read = recv_fn(user, ws, msg->msg.data + buf->offset, to_read, to_read);
+		if (num_read == 0) return false;
 		if (num_read == SIZE_MAX) {
 			ws_fail(ws, BQWS_ERR_IO_READ);
 			return false;
@@ -1657,7 +1694,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 
 	// Peek at all incoming messages before processing
 	if (ws->peek_fn) {
-		ws->peek_fn(ws->peek_user, &msg->msg, true);
+		ws->peek_fn(ws->peek_user, ws, &msg->msg, true);
 	}
 
 	// If we copied the last bytes of the message we can push it
@@ -1833,7 +1870,7 @@ static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 
 	// Peek at all outgoing messages before processing
 	if (ws->peek_fn) {
-		ws->peek_fn(ws->peek_user, &msg->msg, false);
+		ws->peek_fn(ws->peek_user, ws, &msg->msg, false);
 	}
 
 	if (ws->ping_interval != SIZE_MAX) {
@@ -2122,6 +2159,11 @@ bqws_socket *bqws_new_client(const bqws_opts *opts, const bqws_client_opts *clie
 			client_opts = &null_opts;
 		}
 		hs_client_handshake(ws, client_opts);
+
+		// Notify IO that there's a client handshake to send
+		if (ws->user_io.notify_fn) {
+			ws->user_io.notify_fn(ws->user_io.user, ws);
+		}
 	}
 
 	return ws;
@@ -2434,7 +2476,7 @@ void bqws_send(bqws_socket *ws, bqws_msg_type type, const void *data, size_t siz
 	if (!imp) return;
 
 	memcpy(imp->msg.data, data, size);
-	msg_enqueue(&ws->send_queue, imp);
+	ws_enqueue_send(ws, imp);
 }
 
 void bqws_send_binary(bqws_socket *ws, const void *data, size_t size)
@@ -2478,7 +2520,7 @@ void bqws_send_msg(bqws_socket *ws, bqws_msg *msg)
 
 	if (!msg_acquire_ownership(ws, imp)) return;
 
-	msg_enqueue(&ws->send_queue, imp);
+	ws_enqueue_send(ws, imp);
 }
 
 void bqws_send_begin(bqws_socket *ws, bqws_msg_type type)
@@ -2508,7 +2550,7 @@ void bqws_send_append(bqws_socket *ws, const void *data, size_t size)
 
 	if (ws->partial.next_partial_to_send) {
 		bqws_assert(ws->partial.next_partial_to_send->magic == BQWS_MSG_MAGIC);
-		msg_enqueue(&ws->send_queue, ws->partial.next_partial_to_send);
+		ws_enqueue_send(ws, ws->partial.next_partial_to_send);
 	}
 
 	bqws_msg_type partial_type = ws->partial.send_partial_type | BQWS_MSG_PARTIAL_BIT;
@@ -2534,7 +2576,7 @@ void bqws_send_append_msg(bqws_socket *ws, bqws_msg *msg)
 
 	if (ws->partial.next_partial_to_send) {
 		bqws_assert(ws->partial.next_partial_to_send->magic == BQWS_MSG_MAGIC);
-		msg_enqueue(&ws->send_queue, ws->partial.next_partial_to_send);
+		ws_enqueue_send(ws, ws->partial.next_partial_to_send);
 	}
 
 	bqws_msg_imp *imp = msg_imp(msg);
@@ -2558,7 +2600,7 @@ void bqws_send_finish(bqws_socket *ws)
 	if (ws->partial.next_partial_to_send) {
 		bqws_assert(ws->partial.next_partial_to_send->magic == BQWS_MSG_MAGIC);
 		ws->partial.next_partial_to_send->msg.type |= BQWS_MSG_FINAL_BIT;
-		msg_enqueue(&ws->send_queue, ws->partial.next_partial_to_send);
+		ws_enqueue_send(ws, ws->partial.next_partial_to_send);
 		ws->partial.next_partial_to_send = NULL;
 	}
 
@@ -2641,36 +2683,67 @@ void bqws_update_state(bqws_socket *ws)
 
 void bqws_update_io(bqws_socket *ws)
 {
+	bqws_update_io_write(ws);
+	bqws_update_io_read(ws);
+}
+
+void bqws_update_io_read(bqws_socket *ws)
+{
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	if (ws->err) return;
 
-	bqws_mutex_lock(&ws->state.mutex);
+	bool do_read = true;
+
+	bqws_mutex_lock(&ws->io.mutex);
+
 	// If read and write are stopped close the IO
+	bqws_mutex_lock(&ws->state.mutex);
 	if (ws->state.stop_read && ws->state.stop_write) {
 		if (ws->user_io.close_fn && !ws->state.io_closed) {
 			ws->user_io.close_fn(ws->user_io.user, ws);
 			ws->state.io_closed = true;
 		}
-		bqws_mutex_unlock(&ws->state.mutex);
-		return;
 	}
+	do_read = !ws->state.stop_read;
 	bqws_mutex_unlock(&ws->state.mutex);
 
-	bqws_mutex_lock(&ws->io.mutex);
-
 	// TODO: Throttle reads
-
-	// Send data automatically
-	if (ws->user_io.send_fn) {
-		while (ws_write_data(ws, ws->user_io.send_fn, ws->user_io.user)) {
-			// Keep writing as long as there is space
+	if (do_read) {
+		if (ws->user_io.recv_fn) {
+			while (ws_read_data(ws, ws->user_io.recv_fn, ws->user_io.user)) {
+				// Keep reading as long as there is space
+			}
 		}
 	}
 
-	// Receive data automatically
-	if (ws->user_io.recv_fn) {
-		while (ws_read_data(ws, ws->user_io.recv_fn, ws->user_io.user)) {
-			// Keep reading as long as there is space
+	bqws_mutex_unlock(&ws->io.mutex);
+}
+
+void bqws_update_io_write(bqws_socket *ws)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	if (ws->err) return;
+
+	bool do_write = true;
+
+	bqws_mutex_lock(&ws->io.mutex);
+
+	// If read and write are stopped close the IO
+	bqws_mutex_lock(&ws->state.mutex);
+	if (ws->state.stop_read && ws->state.stop_write) {
+		if (ws->user_io.close_fn && !ws->state.io_closed) {
+			ws->user_io.close_fn(ws->user_io.user, ws);
+			ws->state.io_closed = true;
+		}
+	}
+	do_write = !ws->state.stop_write;
+	bqws_mutex_unlock(&ws->state.mutex);
+
+	if (do_write) {
+		if (ws->user_io.send_fn) {
+			while (ws_write_data(ws, ws->user_io.send_fn, ws->user_io.user)) {
+				// Keep writing as long as there is space
+			}
 		}
 	}
 
