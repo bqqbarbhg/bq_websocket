@@ -42,28 +42,41 @@ static size_t net_io_recv(void *user, bqws_socket *ws, void *data, size_t max_si
 	bqws_net_socket *ns = (bqws_net_socket*)user;
 	size_t result = 0;
 
+	size_t offset = 0;
+
 	EnterCriticalSection(&ns->mutex);
 
 	if (ns->recv_async) {
 		DWORD num_read, flags;
-		WSAGetOverlappedResult(ns->socket, &ns->recv_ov, &num_read, FALSE, &flags);
-		if (num_read > 0) ns->recv_async = false;
-		result = (size_t)num_read;
-	} else {
-		ns->recv_buf.buf = (CHAR*)data;
-		ns->recv_buf.len = (ULONG)max_size;
-
-		DWORD num_bytes_instant = 0;
-		DWORD flags = 0;
-		if (min_size != max_size) flags |= MSG_PUSH_IMMEDIATE;
-		else flags |= MSG_WAITALL;
-		WSARecv(ns->socket, &ns->recv_buf, 1, &num_bytes_instant, &flags, &ns->recv_ov, NULL);
-		if (num_bytes_instant > 0) {
-			result = (size_t)num_bytes_instant;
-		} else {
-			ns->recv_async = true;
-			result = 0;
+		BOOL res = WSAGetOverlappedResult(ns->socket, &ns->recv_ov, &num_read, FALSE, &flags);
+		if (res == FALSE) {
+			LeaveCriticalSection(&ns->mutex);
+			return 0;
 		}
+		ns->recv_async = false;
+		result = (size_t)num_read;
+
+		if (result >= min_size) {
+			LeaveCriticalSection(&ns->mutex);
+			return result;
+		} else {
+			offset += result;
+		}
+	}
+
+	ns->recv_buf.buf = (CHAR*)data + offset;
+	ns->recv_buf.len = (ULONG)(max_size - offset);
+
+	DWORD num_bytes_instant = 0;
+	DWORD flags = 0;
+	if (min_size != max_size) flags |= MSG_PUSH_IMMEDIATE;
+	else flags |= MSG_WAITALL;
+	WSARecv(ns->socket, &ns->recv_buf, 1, &num_bytes_instant, &flags, &ns->recv_ov, NULL);
+	if (num_bytes_instant >= min_size) {
+		result = (size_t)num_bytes_instant + offset;
+	} else {
+		ns->recv_async = true;
+		result = 0;
 	}
 
 	LeaveCriticalSection(&ns->mutex);
@@ -74,28 +87,41 @@ static size_t net_io_recv(void *user, bqws_socket *ws, void *data, size_t max_si
 static size_t net_io_send(void *user, bqws_socket *ws, const void *data, size_t size)
 {
 	bqws_net_socket *ns = (bqws_net_socket*)user;
+
 	size_t result = 0;
+	size_t offset = 0;
 
 	EnterCriticalSection(&ns->mutex);
 
-	if (ns->recv_async) {
+	if (ns->send_async) {
 		DWORD num_written, flags;
-		WSAGetOverlappedResult(ns->socket, &ns->send_ov, &num_written, FALSE, &flags);
-		if (num_written > 0) ns->send_async = false;
-		result = (size_t)num_written;
-	} else {
-		ns->send_buf.buf = (CHAR*)data;
-		ns->send_buf.len = (ULONG)size;
-
-		DWORD num_bytes_instant = 0;
-		DWORD flags = 0;
-		WSASend(ns->socket, &ns->send_buf, 1, &num_bytes_instant, flags, &ns->send_ov, NULL);
-		if (num_bytes_instant > 0) {
-			result = (size_t)num_bytes_instant;
-		} else {
-			ns->send_async = true;
-			result = 0;
+		BOOL res = WSAGetOverlappedResult(ns->socket, &ns->send_ov, &num_written, FALSE, &flags);
+		if (res == FALSE) {
+			LeaveCriticalSection(&ns->mutex);
+			return 0;
 		}
+		ns->send_async = false;
+		result = (size_t)num_written;
+
+		if (result >= size) {
+			LeaveCriticalSection(&ns->mutex);
+			return result;
+		} else {
+			offset += result;
+		}
+	}
+
+	ns->send_buf.buf = (CHAR*)data + offset;
+	ns->send_buf.len = (ULONG)(size - offset);
+
+	DWORD num_bytes_instant = 0;
+	DWORD flags = 0;
+	WSASend(ns->socket, &ns->send_buf, 1, &num_bytes_instant, flags, &ns->send_ov, NULL);
+	if (num_bytes_instant > 0) {
+		result = (size_t)num_bytes_instant + offset;
+	} else {
+		ns->send_async = true;
+		result = 0;
 	}
 
 	LeaveCriticalSection(&ns->mutex);
@@ -130,7 +156,10 @@ static DWORD WINAPI net_worker_thread(LPVOID arg)
 
 		if (p_overlapped == &ns->recv_ov && ns->recv_async) do_read = true;
 		if (p_overlapped == &ns->send_ov && ns->send_async) do_write = true;
-		if (p_overlapped == &ns->notify_ov) do_write = true;
+		if (p_overlapped == &ns->notify_ov) {
+			do_read = true;
+			do_write = true;
+		}
 
 		LeaveCriticalSection(&ns->mutex);
 
@@ -198,6 +227,10 @@ static bqws_socket *net_accept(bqws_net_server *s)
 	if (!ns) return NULL;
 
 	bqws_opts opts = s->opts;
+
+	opts.io.recv_fn = &net_io_recv;
+	opts.io.send_fn = &net_io_send;
+	opts.io.notify_fn = &net_io_notify;
 	opts.io.user = ns;
 
 	bqws_socket *ws = bqws_new_server(&opts, &s->server_opts);
@@ -214,6 +247,18 @@ static bqws_socket *net_accept(bqws_net_server *s)
 	return ws;
 }
 
+#else
+
+#include <sys/epoll.h>
+
+int ep_handle; 
+
+static bool net_init(const bqws_net_opts *opts)
+{
+	ep_handle = epoll_create1(0);
+
+}
+
 #endif
 
 bqws_socket *bqws_net_connect(const char *url, const bqws_opts *user_opts, const bqws_client_opts *client_opts)
@@ -224,10 +269,6 @@ bqws_socket *bqws_net_connect(const char *url, const bqws_opts *user_opts, const
 	} else {
 		memset(&opts, 0, sizeof(opts));
 	}
-
-	opts.io.recv_fn = &net_io_recv;
-	opts.io.send_fn = &net_io_send;
-	opts.io.notify_fn = &net_io_notify;
 
 	return bqws_new_client(&opts, client_opts);
 }
@@ -240,10 +281,6 @@ bqws_net_server *bqws_net_listen(uint16_t port, const bqws_opts *user_opts, cons
 	} else {
 		memset(&opts, 0, sizeof(opts));
 	}
-
-	opts.io.recv_fn = &net_io_recv;
-	opts.io.send_fn = &net_io_send;
-	opts.io.notify_fn = &net_io_notify;
 
 	return net_listen(port, &opts, server_opts);
 }

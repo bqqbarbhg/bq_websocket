@@ -1195,6 +1195,11 @@ static void hs_finish_handshake(bqws_socket *ws)
 	ws->io.handshake.data = NULL;
 	ws->io.handshake.size = 0;
 	ws->io.handshake.capacity = 0;
+
+	// Notify IO that the connection is open
+	if (ws->user_io.notify_fn) {
+		ws->user_io.notify_fn(ws->user_io.user, ws);
+	}
 }
 
 static void hs_store_handshake_overflow(bqws_socket *ws)
