@@ -39,6 +39,33 @@ static size_t bqws_timestamp_delta_to_ms(bqws_timestamp begin, bqws_timestamp en
 	return (end - begin) * 1000 / CLOCKS_PER_SEC;
 }
 
+typedef struct {
+	bool is_locked;
+} bqws_mutex;
+
+static void bqws_mutex_init(bqws_mutex *m)
+{
+	m->is_locked = false;
+}
+
+static void bqws_mutex_free(bqws_mutex *m)
+{
+	bqws_assert(!m->is_locked);
+}
+
+static void bqws_mutex_lock(bqws_mutex *m)
+{
+	bqws_assert(!m->is_locked);
+	m->is_locked = true;
+}
+static void bqws_mutex_unlock(bqws_mutex *m)
+{
+	bqws_assert(m->is_locked);
+	m->is_locked = false;
+}
+
+#define bqws_assert_locked(m) bqws_assert((m)->is_locked)
+
 // -- Magic constants
 
 #define BQWS_DELETED_MAGIC   0xbdbdbdbd
@@ -74,13 +101,14 @@ struct bqws_msg_imp {
 #define msg_alloc_size(msg) (sizeof(bqws_msg_imp) + (msg)->capacity)
 
 typedef struct {
+	bqws_mutex mutex;
 	bqws_msg_imp *first, *last;
 } bqws_msg_queue;
 
 typedef struct {
-	uint8_t header[16];
 	bqws_msg_imp *msg;
 	size_t offset;
+	size_t header_offset;
 	size_t header_size;
 	bool finished;
 	bool masked;
@@ -130,19 +158,16 @@ typedef struct {
 // Main socket/context type, passed everywhere as the first argument.
 
 struct bqws_socket {
+
+	// -- Constant data
+
 	uint32_t magic; // = BQWS_SOCKET_MAGIC
 	char *name; // Name high up for debugging
 	bool is_server;
 
-	// Current error state, set to the first error that occurs
-	bqws_error err;
-
-	// Connection state
-	bqws_state state;
-
 	// Copied from `opts`
 	bqws_allocator allocator;
-	bqws_io io;
+	bqws_io user_io;
 	bqws_limits limits;
 	bool recv_partial_messages;
 	bool recv_control_messages;
@@ -160,45 +185,83 @@ struct bqws_socket {
 	size_t ping_interval;
 	size_t close_timeout;
 
-	// Pre-allocated error close message storage
-	char error_msg_data[sizeof(bqws_msg_imp) + sizeof(bqws_err_close_data)];
-	bqws_close_reason peer_reason;
-	bqws_error peer_err;
-	bool stop_write;
-	bool stop_read;
-	bool close_sent;
-	bool close_received;
+	// -- Internally synchronized
 
-	// Total memory allocated through `allocator` at the moment
-	size_t memory_used;
-	bqws_timestamp last_write_ts;
-	bqws_timestamp start_closing_ts;
+	// Current error state, set to the first error that occurs
+	// Error writes are protected by `err_mutex` checking `err` can
+	// be done without a mutex to check for errors from the same thread.
+	bqws_mutex err_mutex;
+	bqws_error err;
 
 	// Message queues
-	size_t recv_partial_size;
 	bqws_msg_queue recv_partial_queue;
 	bqws_msg_queue recv_queue;
 	bqws_msg_queue send_queue;
 
-	// API state
-	bqws_msg_imp *next_partial_to_send;
-	bqws_msg_type send_partial_type;
+	// -- State of the socket, errors 
+	struct {
+		bqws_mutex mutex;
 
-	// Handshake
-	bqws_handshake_buffer handshake;
-	bqws_handshake_buffer handshake_overflow;
-	bqws_client_opts *opts_from_client;
-	char *client_key_base64;
-	char *chosen_protocol;
-	bool client_handshake_done;
+		// Connection state
+		bqws_state state;
 
-	// Write/read buffers
-	bqws_msg_buffer recv_buf;
-	bqws_msg_buffer send_buf;
+		// Pre-allocated error close message storage
+		char error_msg_data[sizeof(bqws_msg_imp) + sizeof(bqws_err_close_data)];
+		bqws_close_reason peer_reason;
+		bqws_error peer_err;
+		bool stop_write;
+		bool stop_read;
+		bool close_sent;
+		bool close_received;
+		bool io_closed;
 
-	// Priority messages
-	bqws_msg_imp *close_to_send;
-	bqws_msg_imp *pong_to_send;
+		char *chosen_protocol;
+
+		bqws_timestamp start_closing_ts;
+
+		// Priority messages
+		bqws_msg_imp *close_to_send;
+		bqws_msg_imp *pong_to_send;
+	
+	} state;
+
+	// -- Allocation
+	struct {
+		bqws_mutex mutex;
+
+		// TODO: Make this atomic?
+		// Total memory allocated through `allocator` at the moment
+		size_t memory_used;
+	} alloc;
+
+	// -- IO
+	struct {
+		bqws_mutex mutex;
+
+		bqws_timestamp last_write_ts;
+		size_t recv_partial_size;
+
+		// Handshake
+		bqws_handshake_buffer handshake;
+		bqws_handshake_buffer handshake_overflow;
+		bqws_client_opts *opts_from_client;
+		char *client_key_base64;
+		bool client_handshake_done;
+
+		// Write/read buffers
+		char recv_header[256];
+		bqws_msg_buffer recv_buf;
+		char send_header[16];
+		bqws_msg_buffer send_buf;
+	} io;
+
+	// -- API
+	struct {
+		bqws_mutex mutex;
+
+		bqws_msg_imp *next_partial_to_send;
+		bqws_msg_type send_partial_type;
+	} partial;
 
 	// User data follows in memory
 	char user_data[];
@@ -233,27 +296,39 @@ static void ws_log2(bqws_socket *ws, const char *a, const char *b)
 	ws->log_fn(ws->log_user, ws, line);
 }
 
-static void ws_set_closed(bqws_socket *ws)
+static void ws_close(bqws_socket *ws)
 {
-	ws_log(ws, "State: CLOSED");
+	bqws_assert_locked(&ws->state.mutex);
 
-	ws->state = BQWS_STATE_CLOSED;
-	ws->stop_read = true;
-	ws->stop_write = true;
+	if (ws->state.state != BQWS_STATE_CLOSED) {
+		ws_log(ws, "State: CLOSED");
+
+		ws->state.state = BQWS_STATE_CLOSED;
+		ws->state.stop_read = true;
+		ws->state.stop_write = true;
+	}
 }
 
 static void ws_fail(bqws_socket *ws, bqws_error err)
 {
+	bool should_close = false;
+
+	bqws_mutex_lock(&ws->state.mutex);
+
 	bqws_assert(err != BQWS_OK);
+
+	bqws_mutex_lock(&ws->err_mutex);
 	if (!ws->err) {
 		// vvv Breakpoint here to stop on first error
 		ws->err = err;
 
+		bqws_mutex_unlock(&ws->err_mutex);
+
 		ws_log2(ws, "Fail: ", bqws_error_str(err));
 
 		// Try to send an error close message
-		if (ws->state == BQWS_STATE_OPEN && !ws->close_to_send) {
-			bqws_msg_imp *close_msg = (bqws_msg_imp*)ws->error_msg_data;
+		if (ws->state.state == BQWS_STATE_OPEN && !ws->state.close_to_send) {
+			bqws_msg_imp *close_msg = (bqws_msg_imp*)ws->state.error_msg_data;
 			close_msg->magic = BQWS_MSG_MAGIC;
 			close_msg->allocator.free_fn = &null_free;
 			close_msg->owner = ws;
@@ -291,23 +366,26 @@ static void ws_fail(bqws_socket *ws, bqws_error err)
 			data->error_be[2] = (uint8_t)(err >> 8);
 			data->error_be[3] = (uint8_t)(err >> 0);
 
-			ws->close_to_send = close_msg;
-			ws->state = BQWS_STATE_CLOSING;
-			ws->start_closing_ts = bqws_get_timestamp();
+			ws->state.close_to_send = close_msg;
+			ws->state.state = BQWS_STATE_CLOSING;
+			ws->state.start_closing_ts = bqws_get_timestamp();
 
-		} else if (ws->state == BQWS_STATE_CONNECTING) {
+		} else if (ws->state.state == BQWS_STATE_CONNECTING) {
 
 			// If there's an error during connection close
 			// the connection immediately
-			ws_set_closed(ws);
+			ws_close(ws);
 
 		}
 
 	}
+	bqws_mutex_unlock(&ws->err_mutex);
 
 	// IO errors should close their respective channels
-	if (err == BQWS_ERR_IO_READ) ws->stop_read = true;
-	if (err == BQWS_ERR_IO_WRITE) ws->stop_write = true;
+	if (err == BQWS_ERR_IO_READ) ws->state.stop_read = true;
+	if (err == BQWS_ERR_IO_WRITE) ws->state.stop_write = true;
+
+	bqws_mutex_unlock(&ws->state.mutex);
 }
 
 static void bqws_sha1(uint8_t digest[20], const void *data, size_t size);
@@ -418,13 +496,39 @@ static void allocator_free(const bqws_allocator *at, void *ptr, size_t size)
 // WebSocket allocation functions. These keep track of total used memory and
 // update the error flag.
 
+static bool ws_add_memory_used(bqws_socket *ws, size_t size)
+{
+	// TODO: Atomics
+	bqws_mutex_lock(&ws->alloc.mutex);
+
+	bool ok = (size <= ws->limits.max_memory_used - ws->alloc.memory_used);
+	if (ok) {
+		ws->alloc.memory_used += size;
+	} else {
+		ws_fail(ws, BQWS_ERR_LIMIT_MAX_MEMORY_USED);
+		bqws_mutex_unlock(&ws->alloc.mutex);
+	}
+
+	bqws_mutex_unlock(&ws->alloc.mutex);
+	return ok;
+}
+
+static void ws_remove_memory_used(bqws_socket *ws, size_t size)
+{
+	if (size == 0) return;
+
+	// TODO: Atomics
+	bqws_mutex_lock(&ws->alloc.mutex);
+
+	bqws_assert(ws->alloc.memory_used >= size);
+	ws->alloc.memory_used -= size;
+
+	bqws_mutex_unlock(&ws->alloc.mutex);
+}
+
 static void *ws_alloc(bqws_socket *ws, size_t size)
 {
-	if (size > ws->limits.max_memory_used - ws->memory_used) {
-		ws_fail(ws, BQWS_ERR_LIMIT_MAX_MEMORY_USED);
-		return NULL;
-	}
-	ws->memory_used += size;
+	if (!ws_add_memory_used(ws, size)) return NULL;
 
 	void *ptr = allocator_alloc(&ws->allocator, size);
 	if (!ptr) ws_fail(ws, BQWS_ERR_ALLOCATOR);
@@ -434,14 +538,8 @@ static void *ws_alloc(bqws_socket *ws, size_t size)
 
 static void *ws_realloc(bqws_socket *ws, void *ptr, size_t old_size, size_t new_size)
 {
-	bqws_assert(ws->memory_used >= old_size);
-	if (new_size > old_size && new_size - old_size > ws->limits.max_memory_used - ws->memory_used) {
-		ws_fail(ws, BQWS_ERR_LIMIT_MAX_MEMORY_USED);
-		return NULL;
-	}
-
-	ws->memory_used += new_size;
-	ws->memory_used -= old_size;
+	if (!ws_add_memory_used(ws, new_size)) return NULL;
+	ws_remove_memory_used(ws, old_size);
 
 	void *new_ptr = allocator_realloc(&ws->allocator, ptr, old_size, new_size);
 	if (!new_ptr) ws_fail(ws, BQWS_ERR_ALLOCATOR);
@@ -451,9 +549,7 @@ static void *ws_realloc(bqws_socket *ws, void *ptr, size_t old_size, size_t new_
 
 static void ws_free(bqws_socket *ws, void *ptr, size_t size)
 {
-	bqws_assert(ws->memory_used >= size);
-	ws->memory_used -= size;
-
+	ws_remove_memory_used(ws, size);
 	allocator_free(&ws->allocator, ptr, size);
 }
 
@@ -507,7 +603,8 @@ static void msg_release_ownership(bqws_socket *ws, bqws_msg_imp *msg)
 	bqws_assert(msg && msg->magic == BQWS_MSG_MAGIC);
 	bqws_assert(msg->owner == ws);
 
-	ws->memory_used -= msg_alloc_size(&msg->msg);
+	ws_remove_memory_used(ws, msg_alloc_size(&msg->msg));
+
 	msg->owner = NULL;
 }
 
@@ -517,13 +614,11 @@ static bool msg_acquire_ownership(bqws_socket *ws, bqws_msg_imp *msg)
 	bqws_assert(msg && msg->magic == BQWS_MSG_MAGIC);
 	bqws_assert(msg->owner == NULL);
 
-	size_t size = msg_alloc_size(&msg->msg);
-	if (size > ws->limits.max_memory_used - ws->memory_used) {
-		ws_fail(ws, BQWS_ERR_LIMIT_MAX_MEMORY_USED);
+	if (!ws_add_memory_used(ws, msg_alloc_size(&msg->msg))) {
+		// We still own the message so need to delete it
+		bqws_free_msg(&msg->msg);
 		return false;
 	}
-
-	ws->memory_used += size;
 	msg->owner = ws;
 
 	return true;
@@ -540,16 +635,17 @@ static void msg_free_owned(bqws_socket *ws, bqws_msg_imp *msg)
 	msg->owner = NULL;
 
 	size_t size = msg_alloc_size(&msg->msg);
-	ws->memory_used -= size;
+
+	ws_remove_memory_used(ws, size);
 
 	bqws_allocator at = msg->allocator;
 	allocator_free(&at, msg, size);
 }
 
-// TODO: Make these operations thread-safe / atomic
-
 static void msg_enqueue(bqws_msg_queue *mq, bqws_msg_imp *msg)
 {
+	bqws_mutex_lock(&mq->mutex);
+
 	// Adjust the last message to point to `msg` and replace
 	// it as the last in the queue
 	bqws_assert(msg && msg->magic == BQWS_MSG_MAGIC && msg->prev == NULL);
@@ -562,10 +658,14 @@ static void msg_enqueue(bqws_msg_queue *mq, bqws_msg_imp *msg)
 		mq->first = msg;
 	}
 	mq->last = msg;
+
+	bqws_mutex_unlock(&mq->mutex);
 }
 
 static bqws_msg_imp *msg_dequeue(bqws_msg_queue *mq)
 {
+	bqws_mutex_lock(&mq->mutex);
+
 	bqws_msg_imp *msg = mq->first;
 
 	if (msg) {
@@ -573,6 +673,7 @@ static bqws_msg_imp *msg_dequeue(bqws_msg_queue *mq)
 		bqws_assert(msg->magic == BQWS_MSG_MAGIC);
 
 		bqws_msg_imp *prev = msg->prev;
+		msg->prev = NULL;
 		mq->first = prev;
 		if (prev) {
 			bqws_assert(prev->magic == BQWS_MSG_MAGIC);
@@ -584,7 +685,14 @@ static bqws_msg_imp *msg_dequeue(bqws_msg_queue *mq)
 		bqws_assert(!mq->last);
 	}
 
+	bqws_mutex_unlock(&mq->mutex);
+
 	return msg;
+}
+
+static void msg_init_queue(bqws_socket *ws, bqws_msg_queue *mq)
+{
+	bqws_mutex_init(&mq->mutex);
 }
 
 static void msg_free_queue(bqws_socket *ws, bqws_msg_queue *mq)
@@ -593,6 +701,8 @@ static void msg_free_queue(bqws_socket *ws, bqws_msg_queue *mq)
 	while ((imp = msg_dequeue(mq)) != 0) {
 		msg_free_owned(ws, imp);
 	}
+
+	bqws_mutex_free(&mq->mutex);
 }
 
 // Masking
@@ -661,24 +771,27 @@ static bqws_forceinline bool str_nonempty(const char *s)
 static void hs_push_size(bqws_socket *ws, const char *data, size_t size)
 {
 	if (ws->err) return;
-	if (size > ws->handshake.capacity - ws->handshake.size) {
+
+	bqws_assert_locked(&ws->io.mutex);
+
+	if (size > ws->io.handshake.capacity - ws->io.handshake.size) {
 		// Grow the buffer geometrically up to `max_handshake_size`
-		size_t new_cap = ws->handshake.capacity * 2;
+		size_t new_cap = ws->io.handshake.capacity * 2;
 		if (new_cap == 0) new_cap = 512;
 		if (new_cap > ws->limits.max_handshake_size) new_cap = ws->limits.max_handshake_size;
-		if (new_cap == ws->handshake.capacity) {
+		if (new_cap == ws->io.handshake.capacity) {
 			ws_fail(ws, BQWS_ERR_LIMIT_MAX_HANDSHAKE_SIZE);
 			return;
 		}
 
-		char *data = ws_realloc(ws, ws->handshake.data,	 ws->handshake.capacity, new_cap);
+		char *data = ws_realloc(ws, ws->io.handshake.data,	 ws->io.handshake.capacity, new_cap);
 		if (!data) return;
-		ws->handshake.data = data;
-		ws->handshake.capacity = new_cap;
+		ws->io.handshake.data = data;
+		ws->io.handshake.capacity = new_cap;
 	}
 
-	memcpy(ws->handshake.data + ws->handshake.size, data, size);
-	ws->handshake.size += size;
+	memcpy(ws->io.handshake.data + ws->io.handshake.size, data, size);
+	ws->io.handshake.size += size;
 }
 
 static void hs_push(bqws_socket *ws, const char *a)
@@ -750,6 +863,8 @@ static void hs_solve_challenge(char dst[32], const char *key_base64)
 
 static void hs_client_handshake(bqws_socket *ws, const bqws_client_opts *opts)
 {
+	bqws_assert_locked(&ws->io.mutex);
+
 	bqws_assert(!ws->is_server);
 
 	const char *path = str_nonempty(opts->path) ? opts->path : "/";
@@ -785,7 +900,7 @@ static void hs_client_handshake(bqws_socket *ws, const bqws_client_opts *opts)
 	// We need to retain the key until we have parsed the server handshake
 	char *key = ws_alloc(ws, CLIENT_KEY_BASE64_MAX_SIZE);
 	if (!key) return;
-	ws->client_key_base64 = key;
+	ws->io.client_key_base64 = key;
 
 	bool ret = hs_to_base64(key, CLIENT_KEY_BASE64_MAX_SIZE, digest, 16);
 	bqws_assert(ret == true); // 32 bytes should always be enough
@@ -798,9 +913,10 @@ static void hs_client_handshake(bqws_socket *ws, const bqws_client_opts *opts)
 
 static void hs_server_handshake(bqws_socket *ws)
 {
+	bqws_assert_locked(&ws->io.mutex);
+
 	bqws_assert(ws->is_server);
-	bqws_assert(ws->chosen_protocol);
-	bqws_assert(ws->opts_from_client);
+	bqws_assert(ws->io.opts_from_client);
 
 	// Fixed header
 	hs_push(ws,
@@ -810,30 +926,37 @@ static void hs_server_handshake(bqws_socket *ws)
 	);
 
 	// Protocol
-	if (*ws->chosen_protocol) {
-		hs_push3(ws, "Sec-WebSocket-Protocol: ", ws->chosen_protocol, "\r\n");
+	bqws_mutex_lock(&ws->state.mutex);
+	const char *protocol = ws->state.chosen_protocol;
+	bqws_mutex_unlock(&ws->state.mutex);
+
+	bqws_assert(protocol);
+	if (*protocol) {
+		hs_push3(ws, "Sec-WebSocket-Protocol: ", protocol, "\r\n");
 	}
 
 	// SHA-1 challenge
 	char accept[32];
-	hs_solve_challenge(accept, ws->opts_from_client->random_key_base64);
+	hs_solve_challenge(accept, ws->io.opts_from_client->random_key_base64);
 	hs_push3(ws, "Sec-WebSocket-Accept: ", accept, "\r\n");
 
 	// Final CRLF
 	hs_push(ws, "\r\n");
 
 	// Free the handshake state
-	ws_free(ws, ws->opts_from_client, sizeof(bqws_client_opts));
-	ws->opts_from_client = NULL;
+	ws_free(ws, ws->io.opts_from_client, sizeof(bqws_client_opts));
+	ws->io.opts_from_client = NULL;
 }
 
 // -- Handshake parsing
 
 static bool hs_parse_literal(bqws_socket *ws, size_t *pos, const char *str)
 {
+	bqws_assert_locked(&ws->io.mutex);
+
 	size_t len = strlen(str);
-	if (ws->handshake.size - *pos < len) return false;
-	const char *ref = ws->handshake.data + *pos;
+	if (ws->io.handshake.size - *pos < len) return false;
+	const char *ref = ws->io.handshake.data + *pos;
 	if (memcmp(ref, str, len) != 0) return false;
 	*pos += len;
 	return true;
@@ -841,13 +964,15 @@ static bool hs_parse_literal(bqws_socket *ws, size_t *pos, const char *str)
 
 static char *hs_parse_token(bqws_socket *ws, size_t *pos, char end)
 {
+	bqws_assert_locked(&ws->io.mutex);
+
 	size_t begin = *pos, p = begin;
-	while (p != ws->handshake.size) {
-		char c = ws->handshake.data[p];
+	while (p != ws->io.handshake.size) {
+		char c = ws->io.handshake.data[p];
 		if (c == end) {
-			ws->handshake.data[p] = '\0';
+			ws->io.handshake.data[p] = '\0';
 			*pos = p + 1;
-			return ws->handshake.data + begin;
+			return ws->io.handshake.data + begin;
 		}
 		if (c == '\r' || c == '\n') return NULL;
 		p++;
@@ -857,8 +982,10 @@ static char *hs_parse_token(bqws_socket *ws, size_t *pos, char end)
 
 static void hs_skip_space(bqws_socket *ws, size_t *pos)
 {
-	while (*pos < ws->handshake.size) {
-		char c = ws->handshake.data[*pos];
+	bqws_assert_locked(&ws->io.mutex);
+
+	while (*pos < ws->io.handshake.size) {
+		char c = ws->io.handshake.data[*pos];
 		if (c != ' ' && c != '\t') break;
 		++*pos;
 	}
@@ -878,15 +1005,17 @@ static bool streq_ic(const char *sa, const char *sb)
 
 static bool hs_parse_client_handshake(bqws_socket *ws)
 {
+	bqws_assert_locked(&ws->io.mutex);
+
 	bqws_assert(ws->is_server);
-	bqws_assert(!ws->opts_from_client);
+	bqws_assert(!ws->io.opts_from_client);
 
 	size_t pos = 0;
 
 	bqws_client_opts *opts = ws_alloc(ws, sizeof(bqws_client_opts));
 	if (!opts) return false;
 	memset(opts, 0, sizeof(bqws_client_opts));
-	ws->opts_from_client = opts;
+	ws->io.opts_from_client = opts;
 
 	// GET /path HTTP/1.1
 	if (!hs_parse_literal(ws, &pos, "GET")) return false;
@@ -929,7 +1058,7 @@ static bool hs_parse_client_handshake(bqws_socket *ws)
 				char *protocol = hs_parse_token(ws, &pos, ',');
 				hs_skip_space(ws, &pos);
 				if (!protocol) {
-					protocol = ws->handshake.data + pos;
+					protocol = ws->io.handshake.data + pos;
 					pos = cur_pos;
 				}
 
@@ -961,7 +1090,7 @@ static bool hs_parse_client_handshake(bqws_socket *ws)
 
 	// Store the end of the parsed header in case we read past the
 	// header in the beginning.
-	ws->handshake.read_offset = pos;
+	ws->io.handshake.read_offset = pos;
 
 	if (!opts->host) opts->host = "";
 	if (!opts->origin) opts->origin = "";
@@ -971,8 +1100,10 @@ static bool hs_parse_client_handshake(bqws_socket *ws)
 
 static bool hs_parse_server_handshake(bqws_socket *ws)
 {
+	bqws_assert_locked(&ws->io.mutex);
+
 	bqws_assert(!ws->is_server);
-	bqws_assert(ws->client_key_base64);
+	bqws_assert(ws->io.client_key_base64);
 
 	size_t pos = 0;
 
@@ -998,32 +1129,49 @@ static bool hs_parse_server_handshake(bqws_socket *ws)
 
 			// Check the SHA of the challenge
 			char reference[32];
-			hs_solve_challenge(reference, ws->client_key_base64);
+			hs_solve_challenge(reference, ws->io.client_key_base64);
 			if (strcmp(header.value, reference) != 0) {
 				ws_fail(ws, BQWS_ERR_HEADER_BAD_ACCEPT);
 				return false;
 			}
 
 			// Free the client key
-			ws_free(ws, ws->client_key_base64, CLIENT_KEY_BASE64_MAX_SIZE);
-			ws->client_key_base64 = NULL;
+			ws_free(ws, ws->io.client_key_base64, CLIENT_KEY_BASE64_MAX_SIZE);
+			ws->io.client_key_base64 = NULL;
 
 		} else if (streq_ic(header.name, "Sec-Websocket-Protocol")) {
 			// Protocol that the server chose
 
-			// Keep the last one if there's duplicates
-			ws_free_str(ws, ws->chosen_protocol);
-			ws->chosen_protocol = ws_copy_str(ws, header.value);
+			// Keep the first one if there's duplicates
+			if (!ws->state.chosen_protocol) {
+				char *copy = ws_copy_str(ws, header.value);
+
+				bqws_mutex_lock(&ws->state.mutex);
+				if (!ws->state.chosen_protocol) {
+					ws->state.chosen_protocol = copy;
+				} else {
+					ws_free_str(ws, copy);
+				}
+				bqws_mutex_unlock(&ws->state.mutex);
+			}
 		}
 	}
 
 	// Store the end of the parsed header in case we read past the
 	// header in the beginning.
-	ws->handshake.read_offset = pos;
+	ws->io.handshake.read_offset = pos;
 
 	// If the server didn't choose any protocol set it as ""
-	if (!ws->chosen_protocol) {
-		ws->chosen_protocol = ws_copy_str(ws, "");
+	if (!ws->state.chosen_protocol) {
+		char *copy = ws_copy_str(ws, "");
+
+		bqws_mutex_lock(&ws->state.mutex);
+		if (!ws->state.chosen_protocol) {
+			ws->state.chosen_protocol = copy;
+		} else {
+			ws_free_str(ws, copy);
+		}
+		bqws_mutex_unlock(&ws->state.mutex);
 	}
 
 	return true;
@@ -1031,29 +1179,36 @@ static bool hs_parse_server_handshake(bqws_socket *ws)
 
 static void hs_finish_handshake(bqws_socket *ws)
 {
+	bqws_assert_locked(&ws->io.mutex);
+
 	if (ws->err) return;
 
 	ws_log(ws, "State: OPEN");
-	ws->state = BQWS_STATE_OPEN;
+
+	bqws_mutex_lock(&ws->state.mutex);
+	ws->state.state = BQWS_STATE_OPEN;
+	bqws_mutex_unlock(&ws->state.mutex);
 
 	// Free the handshake buffer
-	ws_free(ws, ws->handshake.data, ws->handshake.capacity);
-	ws->handshake.data = NULL;
-	ws->handshake.size = 0;
-	ws->handshake.capacity = 0;
+	ws_free(ws, ws->io.handshake.data, ws->io.handshake.capacity);
+	ws->io.handshake.data = NULL;
+	ws->io.handshake.size = 0;
+	ws->io.handshake.capacity = 0;
 }
 
 static void hs_store_handshake_overflow(bqws_socket *ws)
 {
-	size_t offset = ws->handshake.read_offset;
-	size_t left = ws->handshake.size - offset;
+	bqws_assert_locked(&ws->io.mutex);
+
+	size_t offset = ws->io.handshake.read_offset;
+	size_t left = ws->io.handshake.size - offset;
 	if (left == 0) return;
 
-	ws->handshake_overflow.data = ws_alloc(ws, left);
-	if (!ws->handshake_overflow.data) return;
-	memcpy(ws->handshake_overflow.data, ws->handshake.data + offset, left);
-	ws->handshake_overflow.capacity = left;
-	ws->handshake_overflow.size = left;
+	ws->io.handshake_overflow.data = ws_alloc(ws, left);
+	if (!ws->io.handshake_overflow.data) return;
+	memcpy(ws->io.handshake_overflow.data, ws->io.handshake.data + offset, left);
+	ws->io.handshake_overflow.capacity = left;
+	ws->io.handshake_overflow.size = left;
 }
 
 // Control messages
@@ -1080,25 +1235,27 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 
 	if (type == BQWS_MSG_CONTROL_CLOSE) {
 
+		bqws_mutex_lock(&ws->state.mutex);
+
 		// Set peer close reason from the message
 		if (msg->msg.size >= 2) {
-			ws->peer_reason = (bqws_close_reason)(
+			ws->state.peer_reason = (bqws_close_reason)(
 				((uint32_t)(uint8_t)msg->msg.data[0] << 8) |
 				((uint32_t)(uint8_t)msg->msg.data[1] << 0) );
 		} else {
-			ws->peer_reason = BQWS_CLOSE_NO_REASON;
+			ws->state.peer_reason = BQWS_CLOSE_NO_REASON;
 		}
 
 		// Set unknown error if the connection was closed with an error
-		if (ws->peer_reason != BQWS_CLOSE_NORMAL && ws->peer_reason != BQWS_CLOSE_GOING_AWAY) {
-			ws->peer_err = BQWS_ERR_UNKNOWN;
+		if (ws->state.peer_reason != BQWS_CLOSE_NORMAL && ws->state.peer_reason != BQWS_CLOSE_GOING_AWAY) {
+			ws->state.peer_err = BQWS_ERR_UNKNOWN;
 		}
 
 		// Potentially patch bqws-specific info
 		if (msg->msg.size == sizeof(bqws_err_close_data)) {
 			bqws_err_close_data *data = (bqws_err_close_data*)msg->msg.data;
 			if (!memcmp(data->magic, "BQWS", 4)) {
-				ws->peer_err = (bqws_error)(
+				ws->state.peer_err = (bqws_error)(
 					((uint32_t)(uint8_t)data->error_be[0] << 24) |
 					((uint32_t)(uint8_t)data->error_be[1] << 16) |
 					((uint32_t)(uint8_t)data->error_be[2] <<  8) |
@@ -1107,16 +1264,18 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 		}
 
 		// Echo the close message back
-		ws->close_to_send = msg;
+		ws->state.close_to_send = msg;
 
 		// Peer has closed connection so we go directly to CLOSED
 		ws_log(ws, "State: CLOSING (received Close from peer)");
-		ws->state = BQWS_STATE_CLOSING;
-		ws->stop_read = true;
-		ws->close_received = true;
-		if (ws->close_sent) {
-			ws_set_closed(ws);
+		ws->state.state = BQWS_STATE_CLOSING;
+		ws->state.stop_read = true;
+		ws->state.close_received = true;
+		if (ws->state.close_sent) {
+			ws_close(ws);
 		}
+
+		bqws_mutex_unlock(&ws->state.mutex);
 
 		// Don't free the message as it will be re-sent
 		msg = NULL;
@@ -1134,11 +1293,15 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 		// Turn the PING message into a PONG
 		msg->msg.type = BQWS_MSG_CONTROL_PONG;
 
+		bqws_mutex_lock(&ws->state.mutex);
+
 		// Only retain the latest PONG to send back
-		if (ws->pong_to_send) {
-			msg_free_owned(ws, ws->pong_to_send);
+		if (ws->state.pong_to_send) {
+			msg_free_owned(ws, ws->state.pong_to_send);
 		}
-		ws->pong_to_send = msg;
+		ws->state.pong_to_send = msg;
+
+		bqws_mutex_unlock(&ws->state.mutex);
 
 		// Don't free the message as it will be re-sent
 		msg = NULL;
@@ -1165,50 +1328,53 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 static size_t ws_recv_from_handshake_overflow(void *user, bqws_socket *ws, void *data, size_t size)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	bqws_assert_locked(&ws->io.mutex);
 
-	size_t offset = ws->handshake_overflow.read_offset;
-	size_t left = ws->handshake_overflow.size - offset;
+	size_t offset = ws->io.handshake_overflow.read_offset;
+	size_t left = ws->io.handshake_overflow.size - offset;
 	size_t to_copy = size;
 	if (to_copy > left) to_copy = left;
-	memcpy(data, ws->handshake_overflow.data + offset, to_copy);
-	ws->handshake_overflow.read_offset += to_copy;
+	memcpy(data, ws->io.handshake_overflow.data + offset, to_copy);
+	ws->io.handshake_overflow.read_offset += to_copy;
 	return to_copy;
 }
 
-static bool ws_read_handshake(bqws_socket *ws, bqws_recv_fn recv_fn, void *user)
+static bool ws_read_handshake(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 {
+	bqws_assert_locked(&ws->io.mutex);
+
 	for (;;) {
-		if (ws->handshake.size == ws->handshake.capacity) {
+		if (ws->io.handshake.size == ws->io.handshake.capacity) {
 			// Grow the buffer geometrically up to `max_handshake_size`
-			size_t new_cap = ws->handshake.capacity * 2;
+			size_t new_cap = ws->io.handshake.capacity * 2;
 			if (new_cap == 0) new_cap = 512;
 			if (new_cap > ws->limits.max_handshake_size) new_cap = ws->limits.max_handshake_size;
-			if (new_cap == ws->handshake.capacity) {
+			if (new_cap == ws->io.handshake.capacity) {
 				ws_fail(ws, BQWS_ERR_LIMIT_MAX_HANDSHAKE_SIZE);
 				return false;
 			}
 
-			char *data = ws_realloc(ws, ws->handshake.data,	 ws->handshake.capacity, new_cap);
+			char *data = ws_realloc(ws, ws->io.handshake.data,	 ws->io.handshake.capacity, new_cap);
 			if (!data) return false;
-			ws->handshake.data = data;
-			ws->handshake.capacity = new_cap;
+			ws->io.handshake.data = data;
+			ws->io.handshake.capacity = new_cap;
 		}
 
 		// Read some data
-		size_t to_read = ws->handshake.capacity - ws->handshake.size;
-		size_t num_read = recv_fn(user, ws, ws->handshake.data + ws->handshake.size, to_read);
+		size_t to_read = ws->io.handshake.capacity - ws->io.handshake.size;
+		size_t num_read = recv_fn(user, ws, ws->io.handshake.data + ws->io.handshake.size, to_read);
 		if (num_read == SIZE_MAX) {
 			ws_fail(ws, BQWS_ERR_IO_READ);
 			return false;
 		}
 		bqws_assert(num_read <= to_read);
-		ws->handshake.size += num_read;
+		ws->io.handshake.size += num_read;
 
 		// Scan for \r\n\r\n
-		ptrdiff_t begin = (ptrdiff_t)ws->handshake.size - num_read - 4;
+		ptrdiff_t begin = (ptrdiff_t)ws->io.handshake.size - num_read - 4;
 		if (begin < 0) begin = 0;
-		char *ptr = ws->handshake.data + begin;
-		char *end = ws->handshake.data + ws->handshake.size;
+		char *ptr = ws->io.handshake.data + begin;
+		char *end = ws->io.handshake.data + ws->io.handshake.size;
 		while ((ptr = memchr(ptr, '\r', end - ptr)) != NULL) {
 			if (end - ptr >= 4 && !memcmp(ptr, "\r\n\r\n", 4)) {
 				return true;
@@ -1223,29 +1389,41 @@ static bool ws_read_handshake(bqws_socket *ws, bqws_recv_fn recv_fn, void *user)
 	return false;
 }
 
-static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn recv_fn, void *user)
+static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 {
+	bqws_assert_locked(&ws->io.mutex);
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	if (ws->stop_read) return false;
 
-	if (ws->state == BQWS_STATE_CONNECTING) {
+	bqws_msg_buffer *buf = &ws->io.recv_buf;
+
+	bqws_state state;
+
+	bqws_mutex_lock(&ws->state.mutex);
+	if (ws->state.stop_read) {
+		bqws_mutex_unlock(&ws->state.mutex);
+		return false;
+	}
+	state = ws->state.state;
+	bqws_mutex_unlock(&ws->state.mutex);
+
+	if (state == BQWS_STATE_CONNECTING) {
 
 		if (ws->is_server) {
 			// Server: read the client handshake first, after it's done wait for
 			// `ws_write_data()` to set `ws->state == BQWS_STATE_OPEN`
-			if (!ws->client_handshake_done) {
+			if (!ws->io.client_handshake_done) {
 				// Read the client handshake
 				if (ws_read_handshake(ws, recv_fn, user)) {
 					if (!hs_parse_client_handshake(ws)) {
 						ws_fail(ws, BQWS_ERR_HEADER_PARSE);
 						return false;
 					}
-					ws->client_handshake_done = true;
+					ws->io.client_handshake_done = true;
 
 					// Re-use the handshake buffer for the response, but copy
 					// remaining data to be read later
 					hs_store_handshake_overflow(ws);
-					ws->handshake.size = 0;
+					ws->io.handshake.size = 0;
 				}
 			}
 
@@ -1253,7 +1431,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 			return false;
 		} else {
 			// Client: Send the request first before trying to read the response
-			if (!ws->client_handshake_done) return false;
+			if (!ws->io.client_handshake_done) return false;
 			if (!ws_read_handshake(ws, recv_fn, user)) return false;
 
 			if (!hs_parse_server_handshake(ws)) {
@@ -1271,20 +1449,20 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 
 	// If there's still data in the handshake buffer empty it before
 	// reading any new data
-	if (ws->handshake_overflow.data && recv_fn != &ws_recv_from_handshake_overflow) {
+	if (ws->io.handshake_overflow.data && recv_fn != &ws_recv_from_handshake_overflow) {
 
 		// Read from the handshake until we reach the end
-		while (!ws->err && ws->handshake_overflow.read_offset < ws->handshake_overflow.size) {
-			ws_read_data(ws, buf, &ws_recv_from_handshake_overflow, NULL);
+		while (!ws->err && ws->io.handshake_overflow.read_offset < ws->io.handshake_overflow.size) {
+			ws_read_data(ws, &ws_recv_from_handshake_overflow, NULL);
 		}
 
 		if (ws->err) return false;
 
 		// Free the handshake
-		ws_free(ws, ws->handshake_overflow.data, ws->handshake_overflow.capacity);
-		ws->handshake_overflow.data = NULL;
-		ws->handshake_overflow.size = 0;
-		ws->handshake_overflow.capacity = 0;
+		ws_free(ws, ws->io.handshake_overflow.data, ws->io.handshake_overflow.capacity);
+		ws->io.handshake_overflow.data = NULL;
+		ws->io.handshake_overflow.size = 0;
+		ws->io.handshake_overflow.capacity = 0;
 
 		// Continue with reading from the actual data source
 	}
@@ -1292,26 +1470,22 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 	// Header has not been parsed yet
 	if (!buf->msg) {
 
+		size_t to_read = sizeof(ws->io.recv_header) - buf->header_offset;
+		size_t num_read = recv_fn(user, ws, ws->io.recv_header + buf->header_offset, to_read);
+		if (num_read == SIZE_MAX) {
+			ws_fail(ws, BQWS_ERR_IO_READ);
+			return false;
+		}
+		bqws_assert(num_read <= to_read);
+
+		buf->header_offset += num_read;
+
 		// We need to read at least two bytes to determine
 		// the header size
 		if (buf->header_size == 0) {
-			bqws_assert(buf->offset < 2);
-			size_t to_read = 2 - buf->offset;
-			size_t num_read = recv_fn(user, ws, buf->header + buf->offset, to_read);
-			if (num_read == SIZE_MAX) {
-				ws_fail(ws, BQWS_ERR_IO_READ);
-				return false;
-			}
-			bqws_assert(num_read <= to_read);
+			if (buf->header_offset < 2) return false;
 
-			buf->offset += num_read;
-			if (num_read < to_read) return false;
-			if (num_read == SIZE_MAX) {
-				ws_fail(ws, BQWS_ERR_IO_READ);
-				return false;
-			}
-
-			uint8_t mask_len = buf->header[1];
+			uint8_t mask_len = ws->io.recv_header[1];
 			uint32_t len = mask_len & 0x7f;
 
 			// Minimum header size
@@ -1325,29 +1499,13 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 			else if (len == 127) header_size += 8;
 
 			buf->header_size = header_size;
-			bqws_assert(buf->header_size <= sizeof(buf->header));
+			bqws_assert(buf->header_size <= sizeof(ws->io.recv_header));
 		}
 
-		// Read the rest of the header
-		if (buf->offset < buf->header_size) {
-			size_t to_read = buf->header_size - buf->offset;
-			size_t num_read = recv_fn(user, ws, buf->header + buf->offset, to_read);
-			if (num_read == SIZE_MAX) {
-				ws_fail(ws, BQWS_ERR_IO_READ);
-				return false;
-			}
-			bqws_assert(num_read <= to_read);
-
-			buf->offset += num_read;
-			if (num_read < to_read) return false;
-			if (num_read == SIZE_MAX) {
-				ws_fail(ws, BQWS_ERR_IO_READ);
-				return false;
-			}
-		}
+		if (buf->header_offset < buf->header_size) return false;
 
 		// Parse the header and allocate the message
-		const uint8_t *h = buf->header;
+		const uint8_t *h = ws->io.recv_header;
 
 		// Static header bits
 		bool fin = (h[0] & 0x80) != 0;
@@ -1391,7 +1549,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 			h += 4;
 		}
 
-		bqws_assert(h - buf->header == buf->header_size);
+		bqws_assert(h - ws->io.recv_header == buf->header_size);
 
 		bqws_msg_type type = BQWS_MSG_INVALID;
 
@@ -1449,13 +1607,31 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 
 		buf->msg = imp;
 		buf->offset = 0;
+
+		// Copy rest of the header bytes to the message
+		size_t offset = buf->header_size;
+		size_t left = buf->header_offset - offset;
+		if (left > 0) {
+			size_t to_copy = left;
+			if (to_copy > imp->msg.size) to_copy = imp->msg.size;
+			memcpy(imp->msg.data, ws->io.recv_header + offset, to_copy);
+			buf->offset += to_copy;
+			offset += to_copy;
+			left -= to_copy;
+		}
+
+		// If there's still some data shift it as the next header
+		if (left > 0) {
+			memmove(ws->io.recv_header, ws->io.recv_header + offset, left);
+		}
+		buf->header_offset = left;
 	}
 
 	bqws_msg_imp *msg = buf->msg;
 
 	// Read message data if the message is not empty
-	if (msg->msg.size > 0) {
-		bqws_assert(buf->offset < msg->msg.size);
+	bqws_assert(buf->offset <= msg->msg.size);
+	if (msg->msg.size > 0 && buf->offset < msg->msg.size) {
 
 		size_t to_read = msg->msg.size - buf->offset;
 		size_t num_read = recv_fn(user, ws, msg->msg.data + buf->offset, to_read);
@@ -1491,7 +1667,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 	ws_log2(ws, "Received: ", bqws_msg_type_str(buf->msg->msg.type));
 
 	if ((type & BQWS_MSG_PARTIAL_BIT) != 0 && !ws->recv_partial_messages) {
-		ws->recv_partial_size += msg->msg.size;
+		ws->io.recv_partial_size += msg->msg.size;
 
 		// If we dont expose partial messages collect them to `recv_partial_queue`.
 		if (type & BQWS_MSG_FINAL_BIT) {
@@ -1499,7 +1675,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 			// in the queue and enqueue the final one>
 
 			bqws_msg_type base_type = msg->msg.type & BQWS_MSG_TYPE_MASK;
-			bqws_msg_imp *combined = msg_alloc(ws, base_type, ws->recv_partial_size);
+			bqws_msg_imp *combined = msg_alloc(ws, base_type, ws->io.recv_partial_size);
 			if (!combined) return false;
 
 			size_t offset = 0;
@@ -1527,7 +1703,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 			ws_enqueue_recv(ws, combined);
 
 			// Clear the partial total size
-			ws->recv_partial_size = 0;
+			ws->io.recv_partial_size = 0;
 		} else {
 			msg_enqueue(&ws->recv_partial_queue, msg);
 		}
@@ -1549,36 +1725,52 @@ static bool ws_read_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_recv_fn rec
 	return true;
 }
 
-static bool ws_write_handshake(bqws_socket *ws, bqws_send_fn *send_fn, void *user)
+static bool ws_write_handshake(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 {
-	size_t to_send = ws->handshake.size - ws->handshake.write_offset;
-	size_t sent = send_fn(user, ws, ws->handshake.data + ws->handshake.write_offset, to_send);
+	bqws_assert_locked(&ws->io.mutex);
+
+	size_t to_send = ws->io.handshake.size - ws->io.handshake.write_offset;
+	size_t sent = send_fn(user, ws, ws->io.handshake.data + ws->io.handshake.write_offset, to_send);
 	if (sent == SIZE_MAX) {
 		ws_fail(ws, BQWS_ERR_IO_WRITE);
 		return false;
 	}
 
 	bqws_assert(sent <= to_send);
-	ws->handshake.write_offset += sent;
+	ws->io.handshake.write_offset += sent;
 	return sent == to_send;
 }
 
-static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *send_fn, void *user)
+static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	if (ws->stop_write) return false;
+	bqws_assert_locked(&ws->io.mutex);
 
-	if (ws->state == BQWS_STATE_CONNECTING) {
+	bqws_msg_buffer *buf = &ws->io.send_buf;
+
+	bqws_state state;
+	char *protocol;
+
+	bqws_mutex_lock(&ws->state.mutex);
+	if (ws->state.stop_read) {
+		bqws_mutex_unlock(&ws->state.mutex);
+		return false;
+	}
+	state = ws->state.state;
+	protocol = ws->state.chosen_protocol;
+	bqws_mutex_unlock(&ws->state.mutex);
+
+	if (state == BQWS_STATE_CONNECTING) {
 
 		if (ws->is_server) {
 			// Server: read the client handshake first
-			if (!ws->client_handshake_done) return false;
+			if (!ws->io.client_handshake_done) return false;
 
 			// Wait for the user to accept/reject the connection
-			if (!ws->chosen_protocol) return false;
+			if (!protocol) return false;
 
 			// Write the server handshake on demand
-			if (ws->handshake.size == 0) {
+			if (ws->io.handshake.size == 0) {
 				hs_server_handshake(ws);
 				if (ws->err) return false;
 			}
@@ -1591,12 +1783,12 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 
 		} else {
 			// Client: Send the request and always wait for response
-			if (!ws->client_handshake_done) {
+			if (!ws->io.client_handshake_done) {
 				if (!ws_write_handshake(ws, send_fn, user)) return false;
 
 				// Re-use the handshake buffer for the response, 
-				ws->handshake.size = 0;
-				ws->client_handshake_done = true;
+				ws->io.handshake.size = 0;
+				ws->io.client_handshake_done = true;
 			}
 
 			return false;
@@ -1606,28 +1798,29 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 	if (!buf->msg) {
 		// No message: Send high priority messages first.
 
-		if (ws->close_to_send && !ws->close_sent) {
+		bqws_mutex_lock(&ws->state.mutex);
+
+		if (ws->state.close_to_send && !ws->state.close_sent) {
 			// First priority: Send close message
-			buf->msg = ws->close_to_send;
-			ws->close_to_send = NULL;
+			buf->msg = ws->state.close_to_send;
+			ws->state.close_to_send = NULL;
 			bqws_assert(buf->msg->msg.type == BQWS_MSG_CONTROL_CLOSE);
-		} else if (ws->state != BQWS_STATE_OPEN) {
+		} else if (ws->state.state != BQWS_STATE_OPEN) {
 			// Stop sending anything if the state is not open
-			return false;
-		} else if (ws->pong_to_send) {
+		} else if (ws->state.pong_to_send) {
 			// Try to respond to PING messages fast
-			buf->msg = ws->pong_to_send;
-			ws->pong_to_send = NULL;
+			buf->msg = ws->state.pong_to_send;
+			ws->state.pong_to_send = NULL;
 			bqws_assert(buf->msg->msg.type == BQWS_MSG_CONTROL_PONG);
 		} else {
 			// Send user message if there is one
-			bqws_msg_imp *msg = msg_dequeue(&ws->send_queue);
-			if (!msg) {
-				// No messages to send, nothing to do
-				return false;
-			}
-			buf->msg = msg;
+			buf->msg = msg_dequeue(&ws->send_queue);
 		}
+
+		bqws_mutex_unlock(&ws->state.mutex);
+
+		// Did not find any message
+		if (!buf->msg) return false;
 
 		bqws_assert(buf->msg && buf->msg->magic == BQWS_MSG_MAGIC);
 
@@ -1644,7 +1837,7 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 	}
 
 	if (ws->ping_interval != SIZE_MAX) {
-		ws->last_write_ts = bqws_get_timestamp();
+		ws->io.last_write_ts = bqws_get_timestamp();
 	}
 
 	if (buf->header_size == 0) {
@@ -1697,7 +1890,7 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 			payload_ext = 2;
 		}
 
-		uint8_t *h = buf->header;
+		uint8_t *h = ws->io.send_header;
 		// Static header bits
 		h[0] = (fin ? 0x80 : 0x0) | (uint8_t)opcode;
 		h[1] = (mask ? 0x80 : 0x0) | (uint8_t)payload_len;
@@ -1723,28 +1916,27 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 			mask_apply(msg->msg.data, msg->msg.size, mask_key);
 		}
 
-		buf->header_size = h - buf->header;
-		bqws_assert(buf->header_size <= sizeof(buf->header));
+		buf->header_size = h - ws->io.send_header;
+		bqws_assert(buf->header_size <= sizeof(ws->io.send_header));
 	}
 
 	// Send the header
-	if (buf->offset < buf->header_size) {
-		size_t to_send = buf->header_size - buf->offset;
-		size_t sent = send_fn(user, ws, buf->header + buf->offset, to_send);
+	if (buf->header_offset < buf->header_size) {
+		size_t to_send = buf->header_size - buf->header_offset;
+		size_t sent = send_fn(user, ws, ws->io.send_header + buf->header_offset, to_send);
 		if (sent == SIZE_MAX) {
 			ws_fail(ws, BQWS_ERR_IO_WRITE);
 			return false;
 		}
 		bqws_assert(sent <= to_send);
-		buf->offset += sent;
+		buf->header_offset += sent;
 		if (sent < to_send) return false;
 	}
 
 	// Send the message
 	{
-		size_t offset = buf->offset - buf->header_size;
-		size_t to_send = msg->msg.size - offset;
-		size_t sent = send_fn(user, ws, msg->msg.data + offset, to_send);
+		size_t to_send = msg->msg.size - buf->offset;
+		size_t sent = send_fn(user, ws, msg->msg.data + buf->offset, to_send);
 		if (sent == SIZE_MAX) {
 			ws_fail(ws, BQWS_ERR_IO_WRITE);
 			return false;
@@ -1758,10 +1950,12 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 
 	// Mark close as been sent
 	if (msg->msg.type == BQWS_MSG_CONTROL_CLOSE) {
-		ws->close_sent = true;
-		if (ws->close_received) {
-			ws_set_closed(ws);
+		bqws_mutex_lock(&ws->state.mutex);
+		ws->state.close_sent = true;
+		if (ws->state.close_received) {
+			ws_close(ws);
 		}
+		bqws_mutex_unlock(&ws->state.mutex);
 	}
 
 	// Delete the message
@@ -1769,6 +1963,7 @@ static bool ws_write_data(bqws_socket *ws, bqws_msg_buffer *buf, bqws_send_fn *s
 
 	// Sent everything, clear status
 	buf->offset = 0;
+	buf->header_offset = 0;
 	buf->header_size = 0;
 	buf->msg = NULL;
 	return true;
@@ -1848,7 +2043,7 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 	ws->magic = BQWS_SOCKET_MAGIC;
 	ws->is_server = is_server;
 	ws->allocator = opts->allocator;
-	ws->io = opts->io;
+	ws->user_io = opts->io;
 	ws->limits = opts->limits;
 	ws->recv_partial_messages = opts->recv_partial_messages;
 	ws->recv_control_messages = opts->recv_control_messages;
@@ -1863,6 +2058,16 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 
 	ws_expand_default_limits(&ws->limits);
 
+	bqws_mutex_init(&ws->err_mutex);
+	bqws_mutex_init(&ws->state.mutex);
+	bqws_mutex_init(&ws->io.mutex);
+	bqws_mutex_init(&ws->alloc.mutex);
+	bqws_mutex_init(&ws->partial.mutex);
+
+	msg_init_queue(ws, &ws->recv_queue);
+	msg_init_queue(ws, &ws->recv_partial_queue);
+	msg_init_queue(ws, &ws->send_queue);
+
 	if (opts->ping_interval) {
 		ws->ping_interval = opts->ping_interval;
 	} else {
@@ -1873,7 +2078,7 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 
 	bqws_assert(ws->ping_interval > 0);
 	if (ws->ping_interval != SIZE_MAX) {
-		ws->last_write_ts = bqws_get_timestamp();
+		ws->io.last_write_ts = bqws_get_timestamp();
 	}
 
 	// Copy or zero-init user data
@@ -1889,7 +2094,7 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 
 	if (opts->skip_handshake) {
 		ws_log(ws, "State: OPEN (skip handhake)");
-		ws->state = BQWS_STATE_OPEN;
+		ws->state.state = BQWS_STATE_OPEN;
 	} else {
 		ws_log(ws, "State: CONNECTING");
 	}
@@ -1910,7 +2115,7 @@ bqws_socket *bqws_new_client(const bqws_opts *opts, const bqws_client_opts *clie
 	if (!ws) return NULL;
 
 	// Setup client handshake immediately if the socket is not open already
-	if (ws->state == BQWS_STATE_CONNECTING) {
+	if (ws->state.state == BQWS_STATE_CONNECTING) {
 		bqws_client_opts null_opts;
 		if (!client_opts) {
 			memset(&null_opts, 0, sizeof(null_opts));
@@ -1981,53 +2186,72 @@ bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *serv
 
 void bqws_start_closing(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size)
 {
+	if (ws->err) return;
+
+	bqws_mutex_lock(&ws->state.mutex);
+
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	bqws_assert(size == 0 || data);
-	if (ws->err) return;
-	if (ws->close_to_send) return;
-	if (ws->state >= BQWS_STATE_CLOSING) return;
+	if (ws->state.close_to_send || ws->state.state >= BQWS_STATE_CLOSING) {
+		bqws_mutex_unlock(&ws->state.mutex);
+		return;
+	}
 
 	bqws_msg_imp *imp = msg_alloc(ws, BQWS_MSG_CONTROL_CLOSE, size + 2);
-	if (!imp) return;
+	if (imp) {
+		imp->msg.data[0] = (uint8_t)(reason >> 8);
+		imp->msg.data[1] = (uint8_t)(reason & 0xff);
+		memcpy(imp->msg.data + 2, data, size);
 
-	imp->msg.data[0] = (uint8_t)(reason >> 8);
-	imp->msg.data[1] = (uint8_t)(reason & 0xff);
-	memcpy(imp->msg.data + 2, data, size);
-	ws->close_to_send = imp;
-	ws->start_closing_ts = bqws_get_timestamp();
+		ws->state.close_to_send = imp;
+		ws->state.start_closing_ts = bqws_get_timestamp();
 
-	ws_log(ws, "State: CLOSING (user close)");
+		ws_log(ws, "State: CLOSING (user close)");
+	}
+
+	bqws_mutex_unlock(&ws->state.mutex);
 }
 
 void bqws_free_socket(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 
+	if (ws->user_io.close_fn && !ws->state.io_closed) {
+		ws->user_io.close_fn(ws->user_io.user, ws);
+	}
+
 	ws_log(ws, "Freed");
 
 	// Free everything, as the socket may have errored it can
 	// be in almost any state
 
+	// Mutexes
+	bqws_mutex_free(&ws->err_mutex);
+	bqws_mutex_free(&ws->state.mutex);
+	bqws_mutex_free(&ws->io.mutex);
+	bqws_mutex_free(&ws->alloc.mutex);
+	bqws_mutex_free(&ws->partial.mutex);
+
 	// Pending messages
 	msg_free_queue(ws, &ws->recv_queue);
 	msg_free_queue(ws, &ws->recv_partial_queue);
 	msg_free_queue(ws, &ws->send_queue);
-	if (ws->pong_to_send) msg_free_owned(ws, ws->pong_to_send);
-	if (ws->close_to_send) msg_free_owned(ws, ws->close_to_send);
+	if (ws->state.pong_to_send) msg_free_owned(ws, ws->state.pong_to_send);
+	if (ws->state.close_to_send) msg_free_owned(ws, ws->state.close_to_send);
 
 	// Read/write buffers
-	ws_free(ws, ws->handshake.data, ws->handshake.capacity);
-	ws_free(ws, ws->handshake_overflow.data, ws->handshake_overflow.capacity);
-	if (ws->recv_buf.msg) msg_free_owned(ws, ws->recv_buf.msg);
-	if (ws->send_buf.msg) msg_free_owned(ws, ws->send_buf.msg);
-	if (ws->next_partial_to_send) msg_free_owned(ws, ws->next_partial_to_send);
+	ws_free(ws, ws->io.handshake.data, ws->io.handshake.capacity);
+	ws_free(ws, ws->io.handshake_overflow.data, ws->io.handshake_overflow.capacity);
+	if (ws->io.recv_buf.msg) msg_free_owned(ws, ws->io.recv_buf.msg);
+	if (ws->io.send_buf.msg) msg_free_owned(ws, ws->io.send_buf.msg);
+	if (ws->partial.next_partial_to_send) msg_free_owned(ws, ws->partial.next_partial_to_send);
 
 	// Misc buffers
-	if (ws->client_key_base64) ws_free(ws, ws->client_key_base64, CLIENT_KEY_BASE64_MAX_SIZE);
-	if (ws->opts_from_client) ws_free(ws, ws->opts_from_client, sizeof(bqws_client_opts));
+	if (ws->io.client_key_base64) ws_free(ws, ws->io.client_key_base64, CLIENT_KEY_BASE64_MAX_SIZE);
+	if (ws->io.opts_from_client) ws_free(ws, ws->io.opts_from_client, sizeof(bqws_client_opts));
 
 	// String copies
-	ws_free_str(ws, ws->chosen_protocol);
+	ws_free_str(ws, ws->state.chosen_protocol);
 	ws_free_str(ws, ws->name);
 
 	// Verify filter copy
@@ -2038,7 +2262,7 @@ void bqws_free_socket(bqws_socket *ws)
 		ws_free(ws, filter, sizeof(bqws_verify_filter) + filter->text_size);
 	}
 
-	bqws_assert(ws->memory_used == 0);
+	bqws_assert(ws->alloc.memory_used == 0);
 
 	ws->magic = BQWS_DELETED_MAGIC;
 
@@ -2050,21 +2274,30 @@ bqws_client_opts *bqws_server_get_client_opts(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	bqws_assert(ws->is_server);
+	bqws_assert(ws->state.state == BQWS_STATE_CONNECTING);
 
-	return ws->opts_from_client;
+	bqws_mutex_lock(&ws->io.mutex);
+	bqws_client_opts *opts = ws->io.opts_from_client;
+	bqws_mutex_unlock(&ws->io.mutex);
+
+	return opts;
 }
 
 void bqws_server_accept(bqws_socket *ws, const char *protocol)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	bqws_assert(ws->is_server);
-	if (ws->chosen_protocol) return;
+	bqws_assert(ws->state.state == BQWS_STATE_CONNECTING);
 	if (ws->err) return;
 
 	// Use emtpy string to differentiate from not set
 	if (!protocol) protocol = "";
 
-	ws->chosen_protocol = ws_copy_str(ws, protocol);
+	bqws_mutex_lock(&ws->state.mutex);
+	if (!ws->state.chosen_protocol) {
+		ws->state.chosen_protocol = ws_copy_str(ws, protocol);
+	}
+	bqws_mutex_unlock(&ws->state.mutex);
 }
 
 void bqws_server_reject(bqws_socket *ws)
@@ -2078,7 +2311,8 @@ void bqws_server_reject(bqws_socket *ws)
 bqws_state bqws_get_state(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	return ws->state;
+	// No mutex! We can always underestimate the state
+	return ws->state.state;
 }
 
 bqws_error bqws_get_error(const bqws_socket *ws)
@@ -2090,13 +2324,15 @@ bqws_error bqws_get_error(const bqws_socket *ws)
 bool bqws_is_closed(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	return ws->state == BQWS_STATE_CLOSED;
+	// No mutex! We can always underestimate the state
+	return ws->state.state == BQWS_STATE_CLOSED;
 }
 
 size_t bqws_get_memory_used(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	return ws->memory_used;
+	// No mutex! This doesn't need to be accurate
+	return ws->alloc.memory_used;
 }
 
 bool bqws_is_server(const bqws_socket *ws)
@@ -2126,19 +2362,35 @@ const char *bqws_get_name(const bqws_socket *ws)
 bqws_close_reason bqws_get_peer_close_reason(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	return ws->peer_reason;
+
+	bqws_mutex_lock((bqws_mutex*)&ws->state.mutex);
+	bqws_close_reason reason = ws->state.peer_reason;
+	bqws_mutex_unlock((bqws_mutex*)&ws->state.mutex);
+
+	return reason;
 }
 
 bqws_error bqws_get_peer_error(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	return ws->peer_err;
+
+	bqws_mutex_lock((bqws_mutex*)&ws->state.mutex);
+	bqws_error err = ws->state.peer_err;
+	bqws_mutex_unlock((bqws_mutex*)&ws->state.mutex);
+
+	return err;
 }
 
 const char *bqws_get_protocol(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	return ws->chosen_protocol;
+
+	// TODO: Cache this pointer outside of IO mutex
+	bqws_mutex_lock((bqws_mutex*)&ws->state.mutex);
+	const char *protocol = ws->state.chosen_protocol;
+	bqws_mutex_unlock((bqws_mutex*)&ws->state.mutex);
+
+	return protocol;
 }
 
 bqws_msg *bqws_recv(bqws_socket *ws)
@@ -2232,67 +2484,87 @@ void bqws_send_msg(bqws_socket *ws, bqws_msg *msg)
 void bqws_send_begin(bqws_socket *ws, bqws_msg_type type)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	bqws_assert(ws->send_partial_type == BQWS_MSG_INVALID);
-	bqws_assert(ws->next_partial_to_send == NULL);
 	bqws_assert(type == BQWS_MSG_TEXT || type == BQWS_MSG_BINARY);
 	if (ws->err) return;
 
-	ws->send_partial_type = type;
+	bqws_mutex_lock(&ws->partial.mutex);
+
+	bqws_assert(ws->partial.send_partial_type == BQWS_MSG_INVALID);
+	bqws_assert(ws->partial.next_partial_to_send == NULL);
+
+	ws->partial.send_partial_type = type;
+
+	bqws_mutex_unlock(&ws->partial.mutex);
 }
 
 void bqws_send_append(bqws_socket *ws, const void *data, size_t size)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	bqws_assert(ws->send_partial_type != BQWS_MSG_INVALID);
 	if (ws->err) return;
 
-	if (ws->next_partial_to_send) {
-		bqws_assert(ws->next_partial_to_send->magic == BQWS_MSG_MAGIC);
-		msg_enqueue(&ws->send_queue, ws->next_partial_to_send);
+	bqws_mutex_lock(&ws->partial.mutex);
+
+	bqws_assert(ws->partial.send_partial_type != BQWS_MSG_INVALID);
+
+	if (ws->partial.next_partial_to_send) {
+		bqws_assert(ws->partial.next_partial_to_send->magic == BQWS_MSG_MAGIC);
+		msg_enqueue(&ws->send_queue, ws->partial.next_partial_to_send);
 	}
 
-	bqws_msg_type partial_type = ws->send_partial_type | BQWS_MSG_PARTIAL_BIT;
+	bqws_msg_type partial_type = ws->partial.send_partial_type | BQWS_MSG_PARTIAL_BIT;
 	bqws_msg_imp *imp = msg_alloc(ws, partial_type, size);
-	if (!imp) return;
+	if (imp) {
+		memcpy(imp->msg.data, data, size);
+		ws->partial.next_partial_to_send = imp;
+	}
 
-	memcpy(imp->msg.data, data, size);
-	ws->next_partial_to_send = imp;
+	bqws_mutex_unlock(&ws->partial.mutex);
 }
 
 void bqws_send_append_msg(bqws_socket *ws, bqws_msg *msg)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	bqws_assert(ws->send_partial_type != BQWS_MSG_INVALID);
 	bqws_assert(msg->type == BQWS_MSG_TEXT || msg->type == BQWS_MSG_BINARY);
-	bqws_assert((ws->send_partial_type & BQWS_MSG_TYPE_MASK) == msg->type);
 	if (ws->err) return;
 
-	if (ws->next_partial_to_send) {
-		bqws_assert(ws->next_partial_to_send->magic == BQWS_MSG_MAGIC);
-		msg_enqueue(&ws->send_queue, ws->next_partial_to_send);
+	bqws_mutex_lock(&ws->partial.mutex);
+
+	bqws_assert(ws->partial.send_partial_type != BQWS_MSG_INVALID);
+	bqws_assert((ws->partial.send_partial_type & BQWS_MSG_TYPE_MASK) == msg->type);
+
+	if (ws->partial.next_partial_to_send) {
+		bqws_assert(ws->partial.next_partial_to_send->magic == BQWS_MSG_MAGIC);
+		msg_enqueue(&ws->send_queue, ws->partial.next_partial_to_send);
 	}
 
 	bqws_msg_imp *imp = msg_imp(msg);
 	if (!msg_acquire_ownership(ws, imp)) return;
 
-	msg->type = ws->send_partial_type | BQWS_MSG_PARTIAL_BIT;
-	ws->next_partial_to_send = imp;
+	msg->type = ws->partial.send_partial_type | BQWS_MSG_PARTIAL_BIT;
+	ws->partial.next_partial_to_send = imp;
+
+	bqws_mutex_unlock(&ws->partial.mutex);
 }
 
 void bqws_send_finish(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	bqws_assert(ws->send_partial_type != BQWS_MSG_INVALID);
 	if (ws->err) return;
 
-	if (ws->next_partial_to_send) {
-		bqws_assert(ws->next_partial_to_send->magic == BQWS_MSG_MAGIC);
-		ws->next_partial_to_send->msg.type |= BQWS_MSG_FINAL_BIT;
-		msg_enqueue(&ws->send_queue, ws->next_partial_to_send);
-		ws->next_partial_to_send = NULL;
+	bqws_mutex_lock(&ws->partial.mutex);
+
+	bqws_assert(ws->partial.send_partial_type != BQWS_MSG_INVALID);
+
+	if (ws->partial.next_partial_to_send) {
+		bqws_assert(ws->partial.next_partial_to_send->magic == BQWS_MSG_MAGIC);
+		ws->partial.next_partial_to_send->msg.type |= BQWS_MSG_FINAL_BIT;
+		msg_enqueue(&ws->send_queue, ws->partial.next_partial_to_send);
+		ws->partial.next_partial_to_send = NULL;
 	}
 
-	ws->send_partial_type = BQWS_MSG_INVALID;
+	ws->partial.send_partial_type = BQWS_MSG_INVALID;
+
+	bqws_mutex_unlock(&ws->partial.mutex);
 }
 
 void bqws_send_ping(bqws_socket *ws, const void *data, size_t size)
@@ -2319,44 +2591,52 @@ void bqws_update_state(bqws_socket *ws)
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	if (ws->err) return;
 
-	if (ws->state == BQWS_STATE_CONNECTING) {
+	bqws_mutex_lock(&ws->state.mutex);
+	bqws_state state = ws->state.state;
+	char *protocol = ws->state.chosen_protocol;
+	bqws_mutex_unlock(&ws->state.mutex);
+
+	bqws_mutex_lock(&ws->io.mutex);
+
+	if (state == BQWS_STATE_CONNECTING) {
 
 		// If we're connecting but haven't set a protocol and the user
 		// has provided a verify function or filter run it here.
-		if (ws->client_handshake_done && !ws->chosen_protocol && ws->verify_fn) {
+		if (ws->io.client_handshake_done && !protocol && ws->verify_fn) {
 			bqws_assert(ws->is_server);
-			bqws_assert(ws->opts_from_client);
-			ws->verify_fn(ws->verify_user, ws, ws->opts_from_client);
+			bqws_assert(ws->io.opts_from_client);
+			ws->verify_fn(ws->verify_user, ws, ws->io.opts_from_client);
 		}
 
-		return;
-
-	} else if (ws->state == BQWS_STATE_OPEN) {
+	} else if (state == BQWS_STATE_OPEN) {
 
 		// Automatic PING send
 		if (ws->ping_interval != SIZE_MAX) {
 			bqws_timestamp time = bqws_get_timestamp();
-			size_t delta = bqws_timestamp_delta_to_ms(ws->last_write_ts, time);
+			size_t delta = bqws_timestamp_delta_to_ms(ws->io.last_write_ts, time);
 			if (delta > ws->ping_interval) {
-				ws->last_write_ts = time;
+				ws->io.last_write_ts = time;
 				// Maybe send PONG only?
 				bqws_send_ping(ws, NULL, 0);
 			}
 		}
 
-	} else if (ws->state == BQWS_STATE_CLOSING) {
+	} else if (state == BQWS_STATE_CLOSING) {
 
 		// Close timeout
 		if (ws->ping_interval != SIZE_MAX) {
 			bqws_timestamp time = bqws_get_timestamp();
-			size_t delta = bqws_timestamp_delta_to_ms(ws->last_write_ts, time);
+			size_t delta = bqws_timestamp_delta_to_ms(ws->io.last_write_ts, time);
 			if (delta > ws->close_timeout) {
-				ws_set_closed(ws);
+				bqws_mutex_lock(&ws->state.mutex);
+				ws_close(ws);
+				bqws_mutex_unlock(&ws->state.mutex);
 			}
 		}
 
 	}
 
+	bqws_mutex_unlock(&ws->io.mutex);
 }
 
 void bqws_update_io(bqws_socket *ws)
@@ -2364,35 +2644,55 @@ void bqws_update_io(bqws_socket *ws)
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	if (ws->err) return;
 
+	bqws_mutex_lock(&ws->state.mutex);
+	// If read and write are stopped close the IO
+	if (ws->state.stop_read && ws->state.stop_write) {
+		if (ws->user_io.close_fn && !ws->state.io_closed) {
+			ws->user_io.close_fn(ws->user_io.user, ws);
+			ws->state.io_closed = true;
+		}
+		bqws_mutex_unlock(&ws->state.mutex);
+		return;
+	}
+	bqws_mutex_unlock(&ws->state.mutex);
+
+	bqws_mutex_lock(&ws->io.mutex);
+
 	// TODO: Throttle reads
 
 	// Send data automatically
-	if (ws->io.send_fn) {
-		while (ws_write_data(ws, &ws->send_buf, ws->io.send_fn, ws->io.user)) {
+	if (ws->user_io.send_fn) {
+		while (ws_write_data(ws, ws->user_io.send_fn, ws->user_io.user)) {
 			// Keep writing as long as there is space
 		}
 	}
 
 	// Receive data automatically
-	if (ws->io.recv_fn) {
-		while (ws_read_data(ws, &ws->send_buf, ws->io.recv_fn, ws->io.user)) {
+	if (ws->user_io.recv_fn) {
+		while (ws_read_data(ws, ws->user_io.recv_fn, ws->user_io.user)) {
 			// Keep reading as long as there is space
 		}
 	}
+
+	bqws_mutex_unlock(&ws->io.mutex);
 }
 
 size_t bqws_read_from(bqws_socket *ws, const void *data, size_t size)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	bqws_assert(!ws->io.recv_fn);
+	bqws_assert(!ws->user_io.recv_fn);
+
+	bqws_mutex_lock(&ws->io.mutex);
 
 	bqws_mem_stream s;
 	s.ptr = (char*)data;
 	s.end = s.ptr + size;
 
-	while (ws_read_data(ws, &ws->send_buf, &mem_stream_recv, &s)) {
+	while (ws_read_data(ws, &mem_stream_recv, &s)) {
 		// Keep reading as long as there is space
 	}
+
+	bqws_mutex_unlock(&ws->io.mutex);
 
 	return s.ptr - (char*)data;
 }
@@ -2400,15 +2700,19 @@ size_t bqws_read_from(bqws_socket *ws, const void *data, size_t size)
 size_t bqws_write_to(bqws_socket *ws, void *data, size_t size)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	bqws_assert(!ws->io.send_fn);
+	bqws_assert(!ws->user_io.send_fn);
+
+	bqws_mutex_lock(&ws->io.mutex);
 
 	bqws_mem_stream s;
 	s.ptr = (char*)data;
 	s.end = s.ptr + size;
 
-	while (ws_write_data(ws, &ws->send_buf, &mem_stream_send, &s)) {
+	while (ws_write_data(ws, &mem_stream_send, &s)) {
 		// Keep writing as long as there is space
 	}
+
+	bqws_mutex_unlock(&ws->io.mutex);
 
 	return s.ptr - (char*)data;
 }

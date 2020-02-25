@@ -116,8 +116,9 @@ typedef void *bqws_alloc_fn(void *user, size_t size);
 typedef void *bqws_realloc_fn(void *user, void *ptr, size_t old_size, size_t new_size);
 typedef void bqws_free_fn(void *user, void *ptr, size_t size);
 
-typedef size_t bqws_send_fn(void *user, bqws_socket *ws, const void *data, size_t size);
-typedef size_t bqws_recv_fn(void *user, bqws_socket *ws, void *data, size_t size);
+typedef size_t bqws_io_send_fn(void *user, bqws_socket *ws, const void *data, size_t size);
+typedef size_t bqws_io_recv_fn(void *user, bqws_socket *ws, void *data, size_t size);
+typedef size_t bqws_io_close_fn(void *user, bqws_socket *ws);
 
 typedef bool bqws_message_fn(void *user, bqws_msg *msg);
 typedef void bqws_peek_fn(void *user, bqws_msg *msg, bool received);
@@ -132,8 +133,9 @@ typedef struct bqws_allocator {
 
 typedef struct bqws_io {
 	void *user;
-	bqws_send_fn *send_fn;
-	bqws_recv_fn *recv_fn;
+	bqws_io_send_fn *send_fn;
+	bqws_io_recv_fn *recv_fn;
+	bqws_io_close_fn *close_fn;
 } bqws_io;
 
 typedef struct bqws_limits {
