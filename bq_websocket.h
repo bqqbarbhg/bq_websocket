@@ -184,11 +184,17 @@ typedef struct bqws_opts {
 	// default: server: 20000, client: 10000
 	size_t ping_interval;
 
-	// How long to wait for the close response before forcing the
+	// How long to wait (milliseconds) for the close response before forcing the
 	// state to be BQWS_STATE_CLOSED. Use SIZE_MAX to disable
 	// the close timeout.
 	// default: 5000
 	size_t close_timeout;
+
+	// How long to wait (milliseconds) for a ping response before forcing
+	// the state to be BQWS_STATE_CLOSED. Use SIZE_MAX to disable.
+	// the close timeout.
+	// default: 4 * ping_interval
+	size_t ping_response_timeout;
 
 	// Name for the socket for debugging
 	const char *name;
@@ -252,11 +258,19 @@ typedef struct bqws_server_opts {
 
 } bqws_server_opts;
 
+typedef struct bqws_url {
+	bool secure;
+	uint16_t port;
+	char scheme[16];
+	char host[256];
+	const char *path;
+} bqws_url;
+
 // -- WebSocket management
 
 bqws_socket *bqws_new_client(const bqws_opts *opts, const bqws_client_opts *client_opts);
 bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *server_opts);
-void bqws_start_closing(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size);
+void bqws_close(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size);
 void bqws_free_socket(bqws_socket *ws);
 
 // -- Server connect
@@ -293,8 +307,8 @@ void bqws_free_msg(bqws_msg *msg);
 // Single message
 void bqws_send(bqws_socket *ws, bqws_msg_type type, const void *data, size_t size);
 void bqws_send_binary(bqws_socket *ws, const void *data, size_t size);
-void bqws_send_str(bqws_socket *ws, const char *str);
-void bqws_send_str_len(bqws_socket *ws, const void *str, size_t len);
+void bqws_send_text(bqws_socket *ws, const char *str);
+void bqws_send_text_len(bqws_socket *ws, const void *str, size_t len);
 
 // Write to socket-provided memory
 bqws_msg *bqws_allocate_msg(bqws_socket *ws, bqws_msg_type type, size_t size);
@@ -303,6 +317,7 @@ void bqws_send_msg(bqws_socket *ws, bqws_msg *msg);
 // Streaming messages
 void bqws_send_begin(bqws_socket *ws, bqws_msg_type type);
 void bqws_send_append(bqws_socket *ws, const void *data, size_t size);
+void bqws_send_append_str(bqws_socket *ws, const void *str);
 void bqws_send_append_msg(bqws_socket *ws, bqws_msg *msg);
 void bqws_send_finish(bqws_socket *ws);
 
@@ -323,7 +338,9 @@ void bqws_update_io_write(bqws_socket *ws);
 size_t bqws_read_from(bqws_socket *ws, const void *data, size_t size);
 size_t bqws_write_to(bqws_socket *ws, void *data, size_t size);
 
-// -- Debugging
+// -- Utility
+
+bool bqws_parse_url(bqws_url *url, const char *str);
 
 const char *bqws_error_str(bqws_error error);
 const char *bqws_msg_type_str(bqws_msg_type type);

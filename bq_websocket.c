@@ -184,6 +184,7 @@ struct bqws_socket {
 	size_t user_size;
 	size_t ping_interval;
 	size_t close_timeout;
+	size_t ping_response_timeout;
 
 	// -- Internally synchronized
 
@@ -239,6 +240,8 @@ struct bqws_socket {
 		bqws_mutex mutex;
 
 		bqws_timestamp last_write_ts;
+		bqws_timestamp last_read_ts;
+		bqws_timestamp last_ping_ts;
 		size_t recv_partial_size;
 
 		// Handshake
@@ -379,8 +382,9 @@ static void ws_fail(bqws_socket *ws, bqws_error err)
 
 		}
 
+	} else {
+		bqws_mutex_unlock(&ws->err_mutex);
 	}
-	bqws_mutex_unlock(&ws->err_mutex);
 
 	// IO errors should close their respective channels
 	if (err == BQWS_ERR_IO_READ) ws->state.stop_read = true;
@@ -871,6 +875,12 @@ static void hs_client_handshake(bqws_socket *ws, const bqws_client_opts *opts)
 	const char *path = str_nonempty(opts->path) ? opts->path : "/";
 	hs_push3(ws, "GET ", path, " HTTP/1.1\r\n");
 
+	// Static headers
+	hs_push(ws,
+		"Connection: Upgrade\r\n"
+		"Upgrade: websocket\r\n"
+	);
+
 	// User headers
 	if (str_nonempty(opts->host)) hs_push3(ws, "Host: ", opts->host, "\r\n");
 	if (str_nonempty(opts->origin)) hs_push3(ws, "Origin: ", opts->origin, "\r\n");
@@ -1282,8 +1292,12 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 		ws->state.close_to_send = msg;
 
 		// Peer has closed connection so we go directly to CLOSED
-		ws_log(ws, "State: CLOSING (received Close from peer)");
-		ws->state.state = BQWS_STATE_CLOSING;
+		if (ws->state.state == BQWS_STATE_OPEN) {
+			ws_log(ws, "State: CLOSING (received Close from peer)");
+			ws->state.start_closing_ts = bqws_get_timestamp();
+			ws->state.state = BQWS_STATE_CLOSING;
+		}
+
 		ws->state.stop_read = true;
 		ws->state.close_received = true;
 		if (ws->state.close_sent) {
@@ -1507,6 +1521,10 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 				}
 				bqws_assert(num_read <= to_read);
 				buf->header_offset += num_read;
+
+				if (ws->ping_interval != SIZE_MAX) {
+					ws->io.last_read_ts = bqws_get_timestamp();
+				}
 			}
 
 			if (buf->header_offset < 2) return false;
@@ -1540,6 +1558,11 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 			}
 			bqws_assert(num_read <= to_read);
 			buf->header_offset += num_read;
+
+			if (ws->ping_interval != SIZE_MAX) {
+				ws->io.last_read_ts = bqws_get_timestamp();
+			}
+
 			return false;
 		}
 
@@ -1683,12 +1706,12 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 		}
 		bqws_assert(num_read <= to_read);
 
+		if (ws->ping_interval != SIZE_MAX) {
+			ws->io.last_read_ts = bqws_get_timestamp();
+		}
+
 		buf->offset += num_read;
 		if (num_read < to_read) return false;
-		if (num_read == SIZE_MAX) {
-			ws_fail(ws, BQWS_ERR_IO_READ);
-			return false;
-		}
 	}
 
 	if (buf->masked) {
@@ -1794,7 +1817,7 @@ static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 	char *protocol;
 
 	bqws_mutex_lock(&ws->state.mutex);
-	if (ws->state.stop_read) {
+	if (ws->state.stop_write) {
 		bqws_mutex_unlock(&ws->state.mutex);
 		return false;
 	}
@@ -2117,10 +2140,14 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 	}
 
 	ws->close_timeout = opts->close_timeout ? opts->close_timeout : 5000;
+	ws->ping_response_timeout = opts->ping_response_timeout ? opts->ping_response_timeout : 4 * ws->ping_interval;
 
 	bqws_assert(ws->ping_interval > 0);
 	if (ws->ping_interval != SIZE_MAX) {
-		ws->io.last_write_ts = bqws_get_timestamp();
+		bqws_timestamp ts = bqws_get_timestamp();
+		ws->io.last_write_ts = ts;
+		ws->io.last_read_ts = ts;
+		ws->io.last_ping_ts = ts;
 	}
 
 	// Copy or zero-init user data
@@ -2163,7 +2190,10 @@ bqws_socket *bqws_new_client(const bqws_opts *opts, const bqws_client_opts *clie
 			memset(&null_opts, 0, sizeof(null_opts));
 			client_opts = &null_opts;
 		}
+
+		bqws_mutex_lock(&ws->io.mutex);
 		hs_client_handshake(ws, client_opts);
+		bqws_mutex_unlock(&ws->io.mutex);
 
 		// Notify IO that there's a client handshake to send
 		if (ws->user_io.notify_fn) {
@@ -2231,7 +2261,7 @@ bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *serv
 	return ws;
 }
 
-void bqws_start_closing(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size)
+void bqws_close(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size)
 {
 	if (ws->err) return;
 
@@ -2252,6 +2282,7 @@ void bqws_start_closing(bqws_socket *ws, bqws_close_reason reason, const void *d
 
 		ws->state.close_to_send = imp;
 		ws->state.start_closing_ts = bqws_get_timestamp();
+		ws->state.state = BQWS_STATE_CLOSING;
 
 		ws_log(ws, "State: CLOSING (user close)");
 	}
@@ -2489,13 +2520,13 @@ void bqws_send_binary(bqws_socket *ws, const void *data, size_t size)
 	bqws_send(ws, BQWS_MSG_BINARY, data, size);
 }
 
-void bqws_send_str(bqws_socket *ws, const char *str)
+void bqws_send_text(bqws_socket *ws, const char *str)
 {
 	bqws_assert(str);
 	bqws_send(ws, BQWS_MSG_TEXT, str, strlen(str));
 }
 
-void bqws_send_str_len(bqws_socket *ws, const void *str, size_t len)
+void bqws_send_text_len(bqws_socket *ws, const void *str, size_t len)
 {
 	bqws_send(ws, BQWS_MSG_TEXT, str, len);
 }
@@ -2566,6 +2597,11 @@ void bqws_send_append(bqws_socket *ws, const void *data, size_t size)
 	}
 
 	bqws_mutex_unlock(&ws->partial.mutex);
+}
+
+void bqws_send_append_str(bqws_socket *ws, const void *str)
+{
+	bqws_send_append(ws, str, strlen(str));
 }
 
 void bqws_send_append_msg(bqws_socket *ws, bqws_msg *msg)
@@ -2641,6 +2677,7 @@ void bqws_update_state(bqws_socket *ws)
 	bqws_mutex_lock(&ws->state.mutex);
 	bqws_state state = ws->state.state;
 	char *protocol = ws->state.chosen_protocol;
+	bqws_timestamp start_closing_ts = ws->state.start_closing_ts;
 	bqws_mutex_unlock(&ws->state.mutex);
 
 	bqws_mutex_lock(&ws->io.mutex);
@@ -2660,21 +2697,39 @@ void bqws_update_state(bqws_socket *ws)
 		// Automatic PING send
 		if (ws->ping_interval != SIZE_MAX) {
 			bqws_timestamp time = bqws_get_timestamp();
-			size_t delta = bqws_timestamp_delta_to_ms(ws->io.last_write_ts, time);
-			if (delta > ws->ping_interval) {
-				ws->io.last_write_ts = time;
+			size_t delta_read = bqws_timestamp_delta_to_ms(ws->io.last_read_ts, time);
+			size_t delta_ping = bqws_timestamp_delta_to_ms(ws->io.last_ping_ts, time);
+			size_t delta_write = bqws_timestamp_delta_to_ms(ws->io.last_write_ts, time);
+
+			size_t delta = delta_read >= delta_write ? delta_read : delta_write;
+			size_t delta_from_ping = delta <= delta_ping ? delta : delta_ping;
+
+			if (delta_from_ping > ws->ping_interval) {
+				ws->io.last_ping_ts = time;
 				// Maybe send PONG only?
 				bqws_send_ping(ws, NULL, 0);
+			}
+
+			if (ws->ping_response_timeout != SIZE_MAX) {
+				if (delta >= ws->ping_response_timeout) {
+					ws_log(ws, "Ping response timeout");
+
+					bqws_mutex_lock(&ws->state.mutex);
+					ws_close(ws);
+					bqws_mutex_unlock(&ws->state.mutex);
+				}
 			}
 		}
 
 	} else if (state == BQWS_STATE_CLOSING) {
 
 		// Close timeout
-		if (ws->ping_interval != SIZE_MAX) {
+		if (ws->close_timeout != SIZE_MAX) {
 			bqws_timestamp time = bqws_get_timestamp();
-			size_t delta = bqws_timestamp_delta_to_ms(ws->io.last_write_ts, time);
+			size_t delta = bqws_timestamp_delta_to_ms(start_closing_ts, time);
 			if (delta > ws->close_timeout) {
+				ws_log(ws, "Close timeout");
+
 				bqws_mutex_lock(&ws->state.mutex);
 				ws_close(ws);
 				bqws_mutex_unlock(&ws->state.mutex);
@@ -2793,6 +2848,54 @@ size_t bqws_write_to(bqws_socket *ws, void *data, size_t size)
 	bqws_mutex_unlock(&ws->io.mutex);
 
 	return s.ptr - (char*)data;
+}
+
+bool bqws_parse_url(bqws_url *url, const char *str)
+{
+	// Format [wss://][host.example.com][:1234][/path]
+
+	const char *scheme = str;
+	const char *scheme_end = strstr(scheme, "://");
+	const char *host = scheme_end ? scheme_end + 3 : scheme;
+	const char *port = strstr(host, ":");
+	const char *path = strstr(host, "/");
+	if (!path) path = host + strlen(host);
+	if (port && port > path) port = NULL;
+	const char *host_end = port ? port : path;
+
+	size_t scheme_len = scheme_end - scheme;
+	size_t host_len = host_end - host;
+	if (scheme_len >= sizeof(url->scheme)) return false;
+	if (host_len >= sizeof(url->host)) return false;
+
+	bool secure = scheme_len == 3 && !memcmp(scheme, "wss", 3);
+
+	int port_num;
+	if (port) {
+		char *port_end;
+		port_num = (int)strtol(port, &port_end, 10);
+		if (port_end != path) return false;
+		if (port_num < 0 || port_num > UINT16_MAX) return false;
+		port_num = (uint16_t)port_num;
+	} else {
+		port_num = secure ? 443 : 80;
+	}
+
+	// vv No fails below, no writes above ^^
+
+	url->port = (uint16_t)port_num;
+
+	memcpy(url->scheme, scheme, scheme_len);
+	url->scheme[scheme_len] = '\0';
+
+	memcpy(url->host, host, host_len);
+	url->host[host_len] = '\0';
+
+	url->path = *path ? path : "/";
+
+	url->secure = secure;
+
+	return true;
 }
 
 const char *bqws_error_str(bqws_error error)
