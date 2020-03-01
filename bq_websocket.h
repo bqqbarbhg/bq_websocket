@@ -119,6 +119,7 @@ typedef void bqws_free_fn(void *user, void *ptr, size_t size);
 typedef size_t bqws_io_send_fn(void *user, bqws_socket *ws, const void *data, size_t size);
 typedef size_t bqws_io_recv_fn(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size);
 typedef void bqws_io_notify_fn(void *user, bqws_socket *ws);
+typedef bool bqws_io_flush_fn(void *user, bqws_socket *ws);
 typedef void bqws_io_close_fn(void *user, bqws_socket *ws);
 
 typedef bool bqws_message_fn(void *user, bqws_socket *ws, bqws_msg *msg);
@@ -137,6 +138,7 @@ typedef struct bqws_io {
 	bqws_io_send_fn *send_fn;
 	bqws_io_recv_fn *recv_fn;
 	bqws_io_notify_fn *notify_fn;
+	bqws_io_flush_fn *flush_fn;
 	bqws_io_close_fn *close_fn;
 } bqws_io;
 

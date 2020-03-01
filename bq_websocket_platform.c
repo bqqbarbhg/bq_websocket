@@ -12,6 +12,8 @@
 
 typedef struct {
 	SOCKET s;
+	size_t send_size;
+	char send_buf[512];
 } pt_io;
 
 struct bqws_pt_server {
@@ -44,9 +46,8 @@ static SOCKET try_connect(ADDRINFOW *info, int family, ADDRINFOW **used)
 	return INVALID_SOCKET;
 }
 
-static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t size)
+static size_t io_send_imp(pt_io *io, const void *data, size_t size)
 {
-	pt_io *io = (pt_io*)user;
 	int res = send(io->s, data, (int)size, 0);
 	if (res < 0) {
 		int err = WSAGetLastError();
@@ -54,6 +55,77 @@ static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t s
 		return SIZE_MAX;
 	}
 	return (size_t)res;
+}
+
+static bool io_flush_imp(pt_io *io)
+{
+	size_t size = io->send_size;
+	size_t sent = io_send_imp(io, io->send_buf, size);
+	if (sent == 0) return true;
+	if (sent == SIZE_MAX) return false;
+
+	size_t left = size - sent;
+	io->send_size = left;
+	if (left > 0) {
+		memmove(io->send_buf, io->send_buf + sent, left);
+	}
+	return true;
+}
+
+static size_t io_push_imp(pt_io *io, const char *ptr, const char *end)
+{
+	size_t size = end - ptr;
+	size_t offset = io->send_size;
+	size_t to_copy = sizeof(io->send_buf) - offset;
+	if (to_copy > size) to_copy = size;
+	memcpy(io->send_buf + offset, ptr, to_copy);
+	io->send_size += to_copy;
+	return to_copy;
+}
+
+static bool io_setup_imp(pt_io *io)
+{
+	int res;
+
+	io->send_size = 0;
+
+	u_long nb_flag = 1;
+	res = ioctlsocket(io->s, FIONBIO, &nb_flag);
+	if (res != 0) return false;
+
+	BOOL nd_flag = 1;
+	res = setsockopt(io->s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nd_flag, sizeof(nd_flag));
+	if (res != 0) return false;
+
+	return true;
+}
+
+static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t size)
+{
+	pt_io *io = (pt_io*)user;
+
+	const char *begin = (const char*)data, *end = begin + size;
+	const char *ptr = begin;
+
+	// TODO: Try 2*sizeof(io->send_buf) - io->send_size
+	if (size <= sizeof(io->send_buf)) {
+		ptr += io_push_imp(io, ptr, end);
+		if (ptr != end) {
+			if (!io_flush_imp(io)) return SIZE_MAX;
+			ptr += io_push_imp(io, ptr, end);
+		}
+	} else {
+		if (io->send_size > 0) {
+			ptr += io_push_imp(io, ptr, end);
+			if (!io_flush_imp(io)) return SIZE_MAX;
+		}
+
+		size_t sent = io_send_imp(io, ptr, end - ptr);
+		if (sent == SIZE_MAX) return SIZE_MAX;
+		ptr += sent;
+	}
+
+	return ptr - begin;
 }
 
 static size_t pt_io_recv(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size)
@@ -66,6 +138,12 @@ static size_t pt_io_recv(void *user, bqws_socket *ws, void *data, size_t max_siz
 		return SIZE_MAX;
 	}
 	return (size_t)res;
+}
+
+static bool pt_io_flush(void *user, bqws_socket *ws)
+{
+	pt_io *io = (pt_io*)user;
+	return io_flush_imp(io);
 }
 
 static void pt_io_close(void *user, bqws_socket *ws)
@@ -114,22 +192,20 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_opts *opts, const
 		}
 		if (s == INVALID_SOCKET) break;
 
-		u_long nb_flag = 1;
-		res = ioctlsocket(s, FIONBIO, &nb_flag);
-		if (res != 0) break;
-
 		io = (pt_io*)malloc(sizeof(pt_io));
 		if (!io) break;
+
+		io->s = s;
+		if (!io_setup_imp(io)) break;
 
 		// TODO: Retain address?
 		FreeAddrInfoW(info);
 		info = NULL;
 
-		io->s = s;
-
 		opt.io.user = io;
 		opt.io.send_fn = &pt_io_send;
 		opt.io.recv_fn = &pt_io_recv;
+		opt.io.flush_fn = &pt_io_flush;
 		opt.io.close_fn = &pt_io_close;
 
 		ws = bqws_new_client(&opt, client_opts);
@@ -141,7 +217,7 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_opts *opts, const
 
 	// Failure: Free data
 	if (info) FreeAddrInfoW(info);
-	if (io) free(info);
+	if (io) free(io);
 	if (s != INVALID_SOCKET) closesocket(s);
 	return NULL;
 }
@@ -176,7 +252,7 @@ static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *pt_opts)
 		if (res != 0) break;
 
 		sv = (bqws_pt_server*)malloc(sizeof(bqws_pt_server));
-		if (!s) break;
+		if (!sv) break;
 
 		sv->s = s;
 		return sv;
@@ -214,6 +290,7 @@ static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const b
 		if (!io) break;
 
 		io->s = s;
+		if (!io_setup_imp(io)) break;
 
 		bqws_opts opt;
 		if (opts) {
@@ -225,6 +302,7 @@ static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const b
 		opt.io.user = io;
 		opt.io.send_fn = &pt_io_send;
 		opt.io.recv_fn = &pt_io_recv;
+		opt.io.flush_fn = &pt_io_flush;
 		opt.io.close_fn = &pt_io_close;
 
 		ws = bqws_new_server(&opt, server_opts);

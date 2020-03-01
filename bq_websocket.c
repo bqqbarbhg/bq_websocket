@@ -2805,6 +2805,12 @@ void bqws_update_io_write(bqws_socket *ws)
 				// Keep writing as long as there is space
 			}
 		}
+
+		if (ws->user_io.flush_fn) {
+			if (!ws->user_io.flush_fn(ws->user_io.user, ws)) {
+				ws_fail(ws, BQWS_ERR_IO_WRITE);
+			}
+		}
 	}
 
 	bqws_mutex_unlock(&ws->io.mutex);
@@ -2843,6 +2849,12 @@ size_t bqws_write_to(bqws_socket *ws, void *data, size_t size)
 
 	while (ws_write_data(ws, &mem_stream_send, &s)) {
 		// Keep writing as long as there is space
+	}
+
+	if (ws->user_io.flush_fn) {
+		if (!ws->user_io.flush_fn(ws->user_io.user, ws)) {
+			ws_fail(ws, BQWS_ERR_IO_WRITE);
+		}
 	}
 
 	bqws_mutex_unlock(&ws->io.mutex);
