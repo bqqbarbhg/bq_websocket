@@ -8,22 +8,71 @@
 #define _WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
+#define BQWS_PT_USE_OPENSSL 1
+
+#ifndef BQWS_PT_USE_OPENSSL
+#define BQWS_PT_USE_OPENSSL 0
+#endif
+
+#if BQWS_PT_USE_OPENSSL
+	#include <openssl/ssl.h>
+#endif
+
 #pragma comment(lib, "ws2_32.lib")
 
 typedef struct {
 	SOCKET s;
 	size_t send_size;
 	char send_buf[512];
+
+#if BQWS_PT_USE_OPENSSL
+	struct {
+		bool connected;
+		SSL *ssl;
+		BIO *bio;
+	} ssl;
+#endif
+
 } pt_io;
+
+#if BQWS_PT_USE_OPENSSL
+typedef struct {
+	SSL_CTX *ctx;
+} pt_ssl;
+static pt_ssl g_ssl;
+#endif
 
 struct bqws_pt_server {
 	SOCKET s;
+	bool secure;
 };
 
-static void pt_init()
+static bool pt_init(const bqws_pt_init_opts *opts)
 {
 	WSADATA data;
 	WSAStartup(MAKEWORD(2,2), &data);
+	int res;
+
+	#if BQWS_PT_USE_OPENSSL
+	{
+		SSL_library_init();
+
+		g_ssl.ctx = SSL_CTX_new(SSLv23_method());
+
+		if (opts->ca_filename) {
+			res = SSL_CTX_load_verify_locations(g_ssl.ctx, opts->ca_filename, NULL);
+			if (!res) return false;
+		}
+
+		long flags = SSL_OP_NO_COMPRESSION;
+		SSL_CTX_set_options(g_ssl.ctx, flags);
+
+		long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
+		SSL_CTX_set_mode(g_ssl.ctx, mode);
+	}
+	#endif
+
+	return true;
 }
 
 static void pt_shutdown()
@@ -48,7 +97,39 @@ static SOCKET try_connect(ADDRINFOW *info, int family, ADDRINFOW **used)
 
 static size_t io_send_imp(pt_io *io, const void *data, size_t size)
 {
-	int res = send(io->s, data, (int)size, 0);
+	if (size == 0) return 0;
+
+	int res;
+
+	#if BQWS_PT_USE_OPENSSL
+	if (io->ssl.ssl) {
+		if (!io->ssl.connected) {
+			res = SSL_connect(io->ssl.ssl);
+			if (res <= 0) {
+				int err = SSL_get_error(io->ssl.ssl, res);
+				if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+					return 0;
+				} else {
+					return SIZE_MAX;
+				}
+			}
+			io->ssl.connected = true;
+		}
+
+		res = SSL_write(io->ssl.ssl, data, (int)size);
+		if (res <= 0) {
+			int err = SSL_get_error(io->ssl.ssl, res);
+			if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+				return 0;
+			} else {
+				return SIZE_MAX;
+			}
+		}
+		return (size_t)res;
+	}
+	#endif
+
+	res = send(io->s, data, (int)size, 0);
 	if (res < 0) {
 		int err = WSAGetLastError();
 		if (err == WSAEWOULDBLOCK) return 0;
@@ -83,7 +164,7 @@ static size_t io_push_imp(pt_io *io, const char *ptr, const char *end)
 	return to_copy;
 }
 
-static bool io_setup_imp(pt_io *io)
+static bool io_setup_imp(pt_io *io, bool secure, const char *host)
 {
 	int res;
 
@@ -96,6 +177,34 @@ static bool io_setup_imp(pt_io *io)
 	BOOL nd_flag = 1;
 	res = setsockopt(io->s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nd_flag, sizeof(nd_flag));
 	if (res != 0) return false;
+
+	#if BQWS_PT_USE_OPENSSL
+	if (secure) {
+		io->ssl.ssl = SSL_new(g_ssl.ctx);
+		if (!io->ssl.ssl) return false;
+
+		io->ssl.bio = BIO_new_socket((int)io->s, 0);
+		if (!io->ssl.bio) return false;
+
+		SSL_set_bio(io->ssl.ssl, io->ssl.bio, io->ssl.bio);
+
+		if (host) {
+			if (!*host) return false;
+
+			X509_VERIFY_PARAM *param = SSL_get0_param(io->ssl.ssl);
+			X509_VERIFY_PARAM_set_hostflags(param, /* X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS */ 0x4);
+			X509_VERIFY_PARAM_set1_host(param, host, 0);
+
+			SSL_set_verify(io->ssl.ssl, SSL_VERIFY_PEER, NULL);
+		}
+
+		io->ssl.connected = false;
+	} else {
+		io->ssl.ssl = NULL;
+	}
+	#else
+	if (secure) return false;
+	#endif
 
 	return true;
 }
@@ -130,8 +239,39 @@ static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t s
 
 static size_t pt_io_recv(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size)
 {
+	if (max_size == 0) return 0;
 	pt_io *io = (pt_io*)user;
-	int res = recv(io->s, data, (int)max_size, 0);
+	int res;
+
+	#if BQWS_PT_USE_OPENSSL
+	if (io->ssl.ssl) {
+		if (!io->ssl.connected) {
+			res = SSL_connect(io->ssl.ssl);
+			if (res == 0) {
+				int err = SSL_get_error(io->ssl.ssl, res);
+				if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+					return 0;
+				} else {
+					return SIZE_MAX;
+				}
+			}
+			io->ssl.connected = true;
+		}
+
+		res = SSL_read(io->ssl.ssl, data, (int)max_size);
+		if (res <= 0) {
+			int err = SSL_get_error(io->ssl.ssl, res);
+			if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+				return 0;
+			} else {
+				return SIZE_MAX;
+			}
+		}
+		return (size_t)res;
+	}
+	#endif
+
+	res = recv(io->s, data, (int)max_size, 0);
 	if (res < 0) {
 		int err = WSAGetLastError();
 		if (err == WSAEWOULDBLOCK) return 0;
@@ -196,7 +336,7 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_opts *opts, const
 		if (!io) break;
 
 		io->s = s;
-		if (!io_setup_imp(io)) break;
+		if (!io_setup_imp(io, url->secure, url->host)) break;
 
 		// TODO: Retain address?
 		FreeAddrInfoW(info);
@@ -255,6 +395,7 @@ static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *pt_opts)
 		if (!sv) break;
 
 		sv->s = s;
+		sv->secure = pt_opts->secure;
 		return sv;
 
 	} while (false);
@@ -290,7 +431,7 @@ static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const b
 		if (!io) break;
 
 		io->s = s;
-		if (!io_setup_imp(io)) break;
+		if (!io_setup_imp(io, sv->secure, NULL)) break;
 
 		bqws_opts opt;
 		if (opts) {
@@ -321,9 +462,16 @@ static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const b
 
 // -- API
 
-void bqws_pt_init()
+bool bqws_pt_init(const bqws_pt_init_opts *opts)
 {
-	pt_init();
+	bqws_pt_init_opts opt;
+	if (opts) {
+		opt = *opts;
+	} else {
+		memset(&opt, 0, sizeof(opt));
+	}
+
+	return pt_init(&opt);
 }
 
 void bqws_pt_shutdown()

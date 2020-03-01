@@ -2712,7 +2712,7 @@ void bqws_update_state(bqws_socket *ws)
 
 			if (ws->ping_response_timeout != SIZE_MAX) {
 				if (delta >= ws->ping_response_timeout) {
-					ws_log(ws, "Ping response timeout");
+					ws_fail(ws, BQWS_ERR_PING_TIMEOUT);
 
 					bqws_mutex_lock(&ws->state.mutex);
 					ws_close(ws);
@@ -2728,7 +2728,7 @@ void bqws_update_state(bqws_socket *ws)
 			bqws_timestamp time = bqws_get_timestamp();
 			size_t delta = bqws_timestamp_delta_to_ms(start_closing_ts, time);
 			if (delta > ws->close_timeout) {
-				ws_log(ws, "Close timeout");
+				ws_fail(ws, BQWS_ERR_CLOSE_TIMEOUT);
 
 				bqws_mutex_lock(&ws->state.mutex);
 				ws_close(ws);
@@ -2919,6 +2919,8 @@ const char *bqws_error_str(bqws_error error)
 	case BQWS_ERR_LIMIT_MAX_MEMORY_USED: return "LIMIT_MAX_MEMORY_USED";
 	case BQWS_ERR_LIMIT_MAX_RECV_MSG_SIZE: return "LIMIT_MAX_RECV_MSG_SIZE";
 	case BQWS_ERR_LIMIT_MAX_HANDSHAKE_SIZE: return "LIMIT_MAX_HANDSHAKE_SIZE";
+	case BQWS_ERR_PING_TIMEOUT: return "BQWS_ERR_PING_TIMEOUT";
+	case BQWS_ERR_CLOSE_TIMEOUT: return "BQWS_ERR_CLOSE_TIMEOUT";
 	case BQWS_ERR_ALLOCATOR: return "ALLOCATOR";
 	case BQWS_ERR_BAD_CONTINUATION: return "BAD_CONTINUATION";
 	case BQWS_ERR_UNFINISHED_PARTIAL: return "UNFINISHED_PARTIAL";

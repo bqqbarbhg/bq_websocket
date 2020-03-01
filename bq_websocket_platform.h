@@ -5,6 +5,10 @@
 
 typedef struct bqws_pt_server bqws_pt_server;
 
+typedef struct bqws_pt_init_opts {
+	const char *ca_filename;
+} bqws_pt_init_opts;
+
 typedef struct bqws_pt_listen_opts {
 	bool secure;
 	uint16_t port;
@@ -13,7 +17,7 @@ typedef struct bqws_pt_listen_opts {
 
 // -- Global initialization
 
-void bqws_pt_init();
+bool bqws_pt_init(const bqws_pt_init_opts *opts);
 void bqws_pt_shutdown();
 
 // -- Platform socket creation
