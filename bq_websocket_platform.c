@@ -986,7 +986,6 @@ static void os_socket_close(os_socket s)
 typedef struct {
 	bool connected;
 	SSL *ssl;
-	BIO *bio;
 } pt_tls;
 
 typedef struct {
@@ -1035,10 +1034,11 @@ static bool tls_init_client(pt_tls *tls, os_socket s, const bqws_pt_connect_opts
 	tls->ssl = SSL_new(g_tls.ctx);
 	if (!tls->ssl) return false;
 
-	tls->bio = BIO_new_socket((int)s, 0);
-	if (!tls->bio) return false;
+	BIO *bio = BIO_new_socket((int)s, 0);
+	if (!bio) return false;
 
-	SSL_set_bio(tls->ssl, tls->bio, tls->bio);
+	// SSL_free() will free the BIO internally
+	SSL_set_bio(tls->ssl, bio, bio);
 
 	if (!pt_opts->insecure_no_verify_host) {
 		const char *host = client_opts->host;
@@ -1062,7 +1062,6 @@ static bool tls_init_server(pt_tls *tls, const bqws_pt_listen_opts *pt_opts)
 static void tls_free(pt_tls *tls)
 {
 	if (tls->ssl) SSL_free(tls->ssl);
-	if (tls->bio) BIO_free(tls->bio);
 }
 
 static bool tls_imp_connect(pt_tls *tls)
@@ -1410,6 +1409,20 @@ bqws_socket *bqws_pt_connect(const char *url, const bqws_pt_connect_opts *pt_opt
 
 bqws_socket *bqws_pt_connect_url(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
 {
+	bqws_pt_connect_opts popt;
+	if (pt_opts) {
+		popt = *pt_opts;
+	} else {
+		memset(&popt, 0, sizeof(popt));
+	}
+
+	bqws_opts opt;
+	if (opts) {
+		opt = *opts;
+	} else {
+		memset(&opt, 0, sizeof(opt));
+	}
+
 	bqws_client_opts copt;
 	if (client_opts) {
 		copt = *client_opts;
@@ -1420,7 +1433,7 @@ bqws_socket *bqws_pt_connect_url(const bqws_url *url, const bqws_pt_connect_opts
 	if (!copt.host) copt.host = url->host;
 	if (!copt.path) copt.path = url->path;
 
-	return pt_connect(url, pt_opts, opts, &copt);
+	return pt_connect(url, &popt, &opt, &copt);
 }
 
 bqws_pt_server *bqws_pt_listen(const bqws_pt_listen_opts *pt_opts)

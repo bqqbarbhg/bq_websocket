@@ -2047,6 +2047,11 @@ static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 	// Mark close as been sent
 	if (msg->msg.type == BQWS_MSG_CONTROL_CLOSE) {
 		bqws_mutex_lock(&ws->state.mutex);
+		if (ws->state.state == BQWS_STATE_OPEN) {
+			ws_log(ws, "State: CLOSING (queued user close)");
+			ws->state.state = BQWS_STATE_CLOSING;
+			ws->state.start_closing_ts = bqws_get_timestamp();
+		}
 		ws->state.close_sent = true;
 		if (ws->state.close_received) {
 			ws_close(ws);
@@ -2324,6 +2329,30 @@ void bqws_close(bqws_socket *ws, bqws_close_reason reason, const void *data, siz
 	bqws_mutex_unlock(&ws->state.mutex);
 }
 
+void bqws_queue_close(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size)
+{
+	if (ws->err) return;
+
+	bqws_mutex_lock(&ws->state.mutex);
+
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	bqws_assert(size == 0 || data);
+	if (ws->state.close_to_send || ws->state.state >= BQWS_STATE_CLOSING) {
+		bqws_mutex_unlock(&ws->state.mutex);
+		return;
+	}
+
+	bqws_msg_imp *imp = msg_alloc(ws, BQWS_MSG_CONTROL_CLOSE, size + 2);
+	if (imp) {
+		imp->msg.data[0] = (uint8_t)(reason >> 8);
+		imp->msg.data[1] = (uint8_t)(reason & 0xff);
+		memcpy(imp->msg.data + 2, data, size);
+		ws_enqueue_send(ws, imp);
+	}
+
+	bqws_mutex_unlock(&ws->state.mutex);
+}
+
 void bqws_free_socket(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
@@ -2547,7 +2576,6 @@ void bqws_send(bqws_socket *ws, bqws_msg_type type, const void *data, size_t siz
 	bqws_assert((type & BQWS_MSG_PARTIAL_BIT) == 0);
 	if (ws->err) return;
 	bqws_assert(size == 0 || data);
-
 
 	bqws_msg_imp *imp = msg_alloc(ws, type, size);
 	if (!imp) return;

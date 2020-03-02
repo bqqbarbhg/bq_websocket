@@ -37,8 +37,8 @@ void main_loop()
 			bqws_send_text(ws, msg);
 			bqws_update_io_write(ws);
 
-			if (counter > 5) {
-				bqws_close(ws, BQWS_CLOSE_NORMAL, NULL, 0);
+			if (counter >= 5) {
+				bqws_queue_close(ws, BQWS_CLOSE_NORMAL, NULL, 0);
 			}
 		}
 	}

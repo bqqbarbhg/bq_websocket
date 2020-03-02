@@ -282,6 +282,7 @@ typedef struct bqws_url {
 bqws_socket *bqws_new_client(const bqws_opts *opts, const bqws_client_opts *client_opts);
 bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *server_opts);
 void bqws_close(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size);
+void bqws_queue_close(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size);
 void bqws_free_socket(bqws_socket *ws);
 
 // -- Server connect
