@@ -1463,10 +1463,10 @@ const char *bqws_pt_error_code_str(bqws_pt_error_code err)
 {
 	switch (err) {
 	case BQWS_PT_OK: return "OK";
-	case BQWS_PT_ERR_NO_TLS: return "NO_TLS";
-	case BQWS_PT_ERR_NO_SERVER_SUPPORT: return "NO_SERVER_SUPPORT";
-	case BQWS_PT_ERR_OUT_OF_MEMORY: return "OUT_OF_MEMORY";
-	case BQWS_PT_ERR_BAD_URL: return "BAD_URL";
+	case BQWS_PT_ERR_NO_TLS: return "NO_TLS: bq_websocket_platform.c was built without TLS support";
+	case BQWS_PT_ERR_NO_SERVER_SUPPORT: return "NO_SERVER_SUPPORT: The platform doesn't support server sockets";
+	case BQWS_PT_ERR_OUT_OF_MEMORY: return "OUT_OF_MEMORY: Failed to allocate memory";
+	case BQWS_PT_ERR_BAD_URL: return "BAD_URL: Could not parse URL";
 	default: return "(unknown)";
 	}
 }
