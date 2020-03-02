@@ -530,7 +530,6 @@ static bool ws_add_memory_used(bqws_socket *ws, size_t size)
 		ws->alloc.memory_used += size;
 	} else {
 		ws_fail(ws, BQWS_ERR_LIMIT_MAX_MEMORY_USED);
-		bqws_mutex_unlock(&ws->alloc.mutex);
 	}
 
 	bqws_mutex_unlock(&ws->alloc.mutex);
@@ -2982,7 +2981,7 @@ bool bqws_parse_url(bqws_url *url, const char *str)
 	int port_num;
 	if (port) {
 		char *port_end;
-		port_num = (int)strtol(port, &port_end, 10);
+		port_num = (int)strtol(port + 1, &port_end, 10);
 		if (port_end != path) return false;
 		if (port_num < 0 || port_num > UINT16_MAX) return false;
 		port_num = (uint16_t)port_num;

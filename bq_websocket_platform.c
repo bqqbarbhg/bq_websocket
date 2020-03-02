@@ -5,479 +5,11 @@
 #include <stdio.h>
 #include <assert.h>
 
-#if 0
-
-#if defined(_WIN32)
-
-#include <WinSock2.h>
-#include <WS2tcpip.h>
-
-#define _WIN32_LEAN_AND_MEAN
-#include <Windows.h>
-
-#define BQWS_PT_USE_OPENSSL 1
+// -- Generic
 
 #ifndef BQWS_PT_USE_OPENSSL
 #define BQWS_PT_USE_OPENSSL 0
 #endif
-
-#if BQWS_PT_USE_OPENSSL
-	#include <openssl/ssl.h>
-#endif
-
-#pragma comment(lib, "ws2_32.lib")
-
-typedef struct {
-	SOCKET s;
-	size_t send_size;
-	char send_buf[512];
-
-#if BQWS_PT_USE_OPENSSL
-	struct {
-		bool connected;
-		SSL *ssl;
-		BIO *bio;
-	} ssl;
-#endif
-
-} pt_io;
-
-#if BQWS_PT_USE_OPENSSL
-typedef struct {
-	SSL_CTX *ctx;
-} pt_ssl;
-static pt_ssl g_ssl;
-#endif
-
-struct bqws_pt_server {
-	SOCKET s;
-	bool secure;
-};
-
-static bool pt_init(const bqws_pt_init_opts *opts)
-{
-	WSADATA data;
-	WSAStartup(MAKEWORD(2,2), &data);
-	int res;
-
-	#if BQWS_PT_USE_OPENSSL
-	{
-		SSL_library_init();
-
-		g_ssl.ctx = SSL_CTX_new(SSLv23_method());
-
-		if (opts->ca_filename) {
-			res = SSL_CTX_load_verify_locations(g_ssl.ctx, opts->ca_filename, NULL);
-			if (!res) return false;
-		}
-
-		long flags = SSL_OP_NO_COMPRESSION;
-		SSL_CTX_set_options(g_ssl.ctx, flags);
-
-		long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
-		SSL_CTX_set_mode(g_ssl.ctx, mode);
-	}
-	#endif
-
-	return true;
-}
-
-static void pt_shutdown()
-{
-	WSACleanup();
-}
-
-static SOCKET try_connect(ADDRINFOW *info, int family, ADDRINFOW **used)
-{
-	for (; info; info = info->ai_next) {
-		if (info->ai_family != family) continue;
-
-		SOCKET s = socket(family, SOCK_STREAM, IPPROTO_TCP);
-		int res = connect(s, info->ai_addr, (int)info->ai_addrlen);
-		if (res == 0) return s;
-		closesocket(s);
-		*used = info;
-	}
-
-	return INVALID_SOCKET;
-}
-
-static size_t io_send_imp(pt_io *io, const void *data, size_t size)
-{
-	if (size == 0) return 0;
-
-	int res;
-
-	#if BQWS_PT_USE_OPENSSL
-	if (io->ssl.ssl) {
-		if (!io->ssl.connected) {
-			res = SSL_connect(io->ssl.ssl);
-			if (res <= 0) {
-				int err = SSL_get_error(io->ssl.ssl, res);
-				if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-					return 0;
-				} else {
-					return SIZE_MAX;
-				}
-			}
-			io->ssl.connected = true;
-		}
-
-		res = SSL_write(io->ssl.ssl, data, (int)size);
-		if (res <= 0) {
-			int err = SSL_get_error(io->ssl.ssl, res);
-			if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-				return 0;
-			} else {
-				return SIZE_MAX;
-			}
-		}
-		return (size_t)res;
-	}
-	#endif
-
-	res = send(io->s, data, (int)size, 0);
-	if (res < 0) {
-		int err = WSAGetLastError();
-		if (err == WSAEWOULDBLOCK) return 0;
-		return SIZE_MAX;
-	}
-	return (size_t)res;
-}
-
-static bool io_flush_imp(pt_io *io)
-{
-	size_t size = io->send_size;
-	size_t sent = io_send_imp(io, io->send_buf, size);
-	if (sent == 0) return true;
-	if (sent == SIZE_MAX) return false;
-
-	size_t left = size - sent;
-	io->send_size = left;
-	if (left > 0) {
-		memmove(io->send_buf, io->send_buf + sent, left);
-	}
-	return true;
-}
-
-static size_t io_push_imp(pt_io *io, const char *ptr, const char *end)
-{
-	size_t size = end - ptr;
-	size_t offset = io->send_size;
-	size_t to_copy = sizeof(io->send_buf) - offset;
-	if (to_copy > size) to_copy = size;
-	memcpy(io->send_buf + offset, ptr, to_copy);
-	io->send_size += to_copy;
-	return to_copy;
-}
-
-static bool io_setup_imp(pt_io *io, bool secure, const char *host)
-{
-	int res;
-
-	io->send_size = 0;
-
-	u_long nb_flag = 1;
-	res = ioctlsocket(io->s, FIONBIO, &nb_flag);
-	if (res != 0) return false;
-
-	BOOL nd_flag = 1;
-	res = setsockopt(io->s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nd_flag, sizeof(nd_flag));
-	if (res != 0) return false;
-
-	#if BQWS_PT_USE_OPENSSL
-	if (secure) {
-		io->ssl.ssl = SSL_new(g_ssl.ctx);
-		if (!io->ssl.ssl) return false;
-
-		io->ssl.bio = BIO_new_socket((int)io->s, 0);
-		if (!io->ssl.bio) return false;
-
-		SSL_set_bio(io->ssl.ssl, io->ssl.bio, io->ssl.bio);
-
-		if (host) {
-			if (!*host) return false;
-
-			X509_VERIFY_PARAM *param = SSL_get0_param(io->ssl.ssl);
-			X509_VERIFY_PARAM_set_hostflags(param, /* X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS */ 0x4);
-			X509_VERIFY_PARAM_set1_host(param, host, 0);
-
-			SSL_set_verify(io->ssl.ssl, SSL_VERIFY_PEER, NULL);
-		}
-
-		io->ssl.connected = false;
-	} else {
-		io->ssl.ssl = NULL;
-	}
-	#else
-	if (secure) return false;
-	#endif
-
-	return true;
-}
-
-static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t size)
-{
-	pt_io *io = (pt_io*)user;
-
-	const char *begin = (const char*)data, *end = begin + size;
-	const char *ptr = begin;
-
-	// TODO: Try 2*sizeof(io->send_buf) - io->send_size
-	if (size <= sizeof(io->send_buf)) {
-		ptr += io_push_imp(io, ptr, end);
-		if (ptr != end) {
-			if (!io_flush_imp(io)) return SIZE_MAX;
-			ptr += io_push_imp(io, ptr, end);
-		}
-	} else {
-		if (io->send_size > 0) {
-			ptr += io_push_imp(io, ptr, end);
-			if (!io_flush_imp(io)) return SIZE_MAX;
-		}
-
-		size_t sent = io_send_imp(io, ptr, end - ptr);
-		if (sent == SIZE_MAX) return SIZE_MAX;
-		ptr += sent;
-	}
-
-	return ptr - begin;
-}
-
-static size_t pt_io_recv(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size)
-{
-	if (max_size == 0) return 0;
-	pt_io *io = (pt_io*)user;
-	int res;
-
-	#if BQWS_PT_USE_OPENSSL
-	if (io->ssl.ssl) {
-		if (!io->ssl.connected) {
-			res = SSL_connect(io->ssl.ssl);
-			if (res == 0) {
-				int err = SSL_get_error(io->ssl.ssl, res);
-				if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-					return 0;
-				} else {
-					return SIZE_MAX;
-				}
-			}
-			io->ssl.connected = true;
-		}
-
-		res = SSL_read(io->ssl.ssl, data, (int)max_size);
-		if (res <= 0) {
-			int err = SSL_get_error(io->ssl.ssl, res);
-			if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-				return 0;
-			} else {
-				return SIZE_MAX;
-			}
-		}
-		return (size_t)res;
-	}
-	#endif
-
-	res = recv(io->s, data, (int)max_size, 0);
-	if (res < 0) {
-		int err = WSAGetLastError();
-		if (err == WSAEWOULDBLOCK) return 0;
-		return SIZE_MAX;
-	}
-	return (size_t)res;
-}
-
-static bool pt_io_flush(void *user, bqws_socket *ws)
-{
-	pt_io *io = (pt_io*)user;
-	return io_flush_imp(io);
-}
-
-static void pt_io_close(void *user, bqws_socket *ws)
-{
-	pt_io *io = (pt_io*)user;
-	closesocket(io->s);
-	free(io);
-}
-
-static bqws_socket *pt_connect(const bqws_url *url, const bqws_opts *opts, const bqws_client_opts *client_opts)
-{
-	SOCKET s = INVALID_SOCKET;
-	ADDRINFOW *info = NULL;
-	pt_io *io = NULL;
-	bqws_socket *ws = NULL;
-
-	wchar_t whost[256];
-	wchar_t service[32];
-
-	wsprintfW(service, L"%u", (unsigned)url->port);
-
-	bqws_opts opt;
-	if (opts) {
-		opt = *opts;
-	} else {
-		memset(&opt, 0, sizeof(opt));
-	}
-
-	do {
-
-		int res = MultiByteToWideChar(CP_UTF8, 0, url->host, -1, whost, sizeof(whost) / sizeof(*whost));
-		if (res == 0) break;
-
-		ADDRINFOW hints = { 0 };
-		hints.ai_family = AF_UNSPEC;
-		hints.ai_socktype = SOCK_STREAM;
-		hints.ai_protocol = IPPROTO_TCP;
-
-		res = GetAddrInfoW(whost, service, &hints, &info);
-		if (res != 0) break;
-
-		ADDRINFOW *used_info = NULL;
-		SOCKET s = try_connect(info, AF_INET6, &used_info);
-		if (s == INVALID_SOCKET) {
-			s = try_connect(info, AF_INET, &used_info);
-		}
-		if (s == INVALID_SOCKET) break;
-
-		io = (pt_io*)malloc(sizeof(pt_io));
-		if (!io) break;
-
-		io->s = s;
-		if (!io_setup_imp(io, url->secure, url->host)) break;
-
-		// TODO: Retain address?
-		FreeAddrInfoW(info);
-		info = NULL;
-
-		bqws_opts opt;
-		if (opts) {
-			opt = *opts;
-		} else {
-			memset(&opt, 0, sizeof(opt));
-		}
-
-		opt.io.user = io;
-		opt.io.send_fn = &pt_io_send;
-		opt.io.recv_fn = &pt_io_recv;
-		opt.io.flush_fn = &pt_io_flush;
-		opt.io.close_fn = &pt_io_close;
-
-		ws = bqws_new_client(&opt, client_opts);
-		if (!ws) break;
-
-		return ws;
-
-	} while (false);
-
-	// Failure: Free data
-	if (info) FreeAddrInfoW(info);
-	if (io) free(io);
-	if (s != INVALID_SOCKET) closesocket(s);
-	return NULL;
-}
-
-static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *pt_opts)
-{
-	SOCKET s = INVALID_SOCKET;
-	bqws_pt_server *sv = NULL;
-	int res;
-
-	do {
-		s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-		if (!s) break;
-
-		DWORD ipv6_flag = 0;
-		res = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&ipv6_flag, sizeof(ipv6_flag));
-		if (res != 0) break;
-
-		u_long nb_flag = 1;
-		res = ioctlsocket(s, FIONBIO, &nb_flag);
-		if (res != 0) break;
-
-		struct sockaddr_in6 addr = { 0 };
-		addr.sin6_family = AF_INET6;
-		addr.sin6_addr = in6addr_any;
-		addr.sin6_port = htons(pt_opts->port);
-
-		res = bind(s, (struct sockaddr*)&addr, sizeof(addr));
-		if (res != 0) break;
-
-		res = listen(s, (int)pt_opts->backlog);
-		if (res != 0) break;
-
-		sv = (bqws_pt_server*)malloc(sizeof(bqws_pt_server));
-		if (!sv) break;
-
-		sv->s = s;
-		sv->secure = pt_opts->secure;
-		return sv;
-
-	} while (false);
-
-	if (s != INVALID_SOCKET) closesocket(s);
-	if (sv) free(sv);
-	return NULL;
-}
-
-static void pt_free_server(bqws_pt_server *sv)
-{
-	closesocket(sv->s);
-	free(sv);
-}
-
-static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const bqws_server_opts *server_opts)
-{
-	struct sockaddr_in6 addr;
-	int addr_len = sizeof(addr);
-	SOCKET s = accept(sv->s, (struct sockaddr*)&addr, &addr_len);
-	if (s == INVALID_SOCKET) return NULL;
-
-	pt_io *io = NULL;
-	bqws_socket *ws = NULL;
-
-	do {
-
-		u_long nb_flag = 1;
-		int res = ioctlsocket(s, FIONBIO, &nb_flag);
-		if (res != 0) break;
-
-		io = (pt_io*)malloc(sizeof(pt_io));
-		if (!io) break;
-
-		io->s = s;
-		if (!io_setup_imp(io, sv->secure, NULL)) break;
-
-		bqws_opts opt;
-		if (opts) {
-			opt = *opts;
-		} else {
-			memset(&opt, 0, sizeof(opt));
-		}
-
-		opt.io.user = io;
-		opt.io.send_fn = &pt_io_send;
-		opt.io.recv_fn = &pt_io_recv;
-		opt.io.flush_fn = &pt_io_flush;
-		opt.io.close_fn = &pt_io_close;
-
-		ws = bqws_new_server(&opt, server_opts);
-		if (!ws) break;
-
-		return ws;
-
-	} while (false);
-
-	if (io) free(io);
-	closesocket(s);
-	return NULL;
-}
-
-#endif
-
-
-#endif
-
-// -- Generic
 
 #if defined(_WIN32)
 __declspec(thread) static bqws_pt_error t_err;
@@ -546,7 +78,6 @@ EM_JS(int, pt_em_connect_websocket, (bqws_socket *bqws, const char *url, const c
 	if (Module.g_bqws_pt_sockets === undefined) {
 		Module.g_bqws_pt_sockets = {
 			sockets: [null],
-			closed: [true],
 			free_list: [],
 		};
 	}
@@ -570,6 +101,11 @@ EM_JS(int, pt_em_connect_websocket, (bqws_socket *bqws, const char *url, const c
 
 		_pt_em_on_close(bqws);
 	};
+	ws.onerror = function(e) {
+		if (Module.g_bqws_pt_sockets.sockets[handle] !== ws) return;
+
+		_pt_em_on_close(bqws);
+	};
 
 	ws.onmessage = function(e) {
 		if (Module.g_bqws_pt_sockets.sockets[handle] !== ws) return;
@@ -582,10 +118,10 @@ EM_JS(int, pt_em_connect_websocket, (bqws_socket *bqws, const char *url, const c
 				_pt_em_msg_recv(bqws, ptr);
 			}
 		} else {
-			var size = e.data.byteSize;
+			var size = e.data.byteLength;
 			var ptr = _pt_em_msg_alloc(bqws, size, 2);
 			if (ptr != 0) {
-				HEAP8.set(new Uint8Array(e.data), ptr);
+				HEAPU8.set(new Uint8Array(e.data), ptr);
 				_pt_em_msg_recv(bqws, ptr);
 			}
 		}
@@ -595,15 +131,14 @@ EM_JS(int, pt_em_connect_websocket, (bqws_socket *bqws, const char *url, const c
 });
 
 EM_JS(int, pt_em_websocket_send_binary, (int handle, const char *data, size_t size), {
-	var ws = g_bqws_pt_sockets.sockets[handle];
+	var ws = Module.g_bqws_pt_sockets.sockets[handle];
 	if (ws.readyState == 0) {
 		return 0;
 	} else if (ws.readyState != 1) {
 		return 1;
 	}
 
-	var view = makeHEAPView("U8", "data", "data+size");
-	ws.send(view);
+	ws.send(HEAPU8.subarray(data, data + size));
 	return 1;
 });
 
@@ -798,7 +333,7 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 
 static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *opts)
 {
-	pt_fail_pt("pt_listen", BQWS_PT_ERR_NO_SERVER_SUPPORT);
+	pt_fail_pt("pt_listen()", BQWS_PT_ERR_NO_SERVER_SUPPORT);
 	return NULL;
 }
 
@@ -840,7 +375,7 @@ static bool os_init(const bqws_pt_init_opts *opts)
 	WSADATA data;
 
 	int res = WSAStartup(MAKEWORD(2,2), &data);
-	if (res != 0) { pt_fail_wsa("WSAStartup"); return false; }
+	if (res != 0) { pt_fail_wsa("WSAStartup()"); return false; }
 
 	return true;
 }
@@ -848,18 +383,6 @@ static bool os_init(const bqws_pt_init_opts *opts)
 static void os_shutdown()
 {
 	WSACleanup();
-}
-
-static bool os_config_listen_socket(os_socket s)
-{
-	int res;
-
-	// Set the socket to be non-blocking
-	u_long nb_flag = 1;
-	res = ioctlsocket(s, FIONBIO, &nb_flag);
-	if (res != 0) { pt_fail_wsa("ioctlsocket(FIONBIO)"); return false; }
-
-	return true;
 }
 
 static bool os_imp_config_data_socket(os_socket s)
@@ -885,8 +408,10 @@ static os_socket os_imp_try_connect(ADDRINFOW *info, int family, ADDRINFOW **use
 		if (info->ai_family != family) continue;
 
 		SOCKET s = socket(family, SOCK_STREAM, IPPROTO_TCP);
+		if (s == INVALID_SOCKET) { pt_fail_wsa("socket()"); return s; }
 		int res = connect(s, info->ai_addr, (int)info->ai_addrlen);
 		if (res == 0) return s;
+		pt_fail_wsa("connect()");
 		closesocket(s);
 		*used = info;
 	}
@@ -912,7 +437,7 @@ static os_socket os_socket_connect(const bqws_url *url)
 	ADDRINFOW *info;
 	res = GetAddrInfoW(whost, service, &hints, &info);
 	if (res != 0) {
-		pt_fail_wsa("GetAddrInfoW");
+		pt_fail_wsa("GetAddrInfoW()");
 		return INVALID_SOCKET;
 	}
 
@@ -933,6 +458,60 @@ static os_socket os_socket_connect(const bqws_url *url)
 	return s;
 }
 
+static os_socket os_socket_listen(const bqws_pt_listen_opts *pt_opts)
+{
+	os_socket s = OS_BAD_SOCKET;
+	bqws_pt_server *sv = NULL;
+	int res;
+
+	do {
+		s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+		if (s == INVALID_SOCKET) { pt_fail_wsa("socket()"); break; }
+
+		// Make sure the socket supports both IPv4 and IPv6
+		DWORD ipv6_flag = 0;
+		res = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&ipv6_flag, sizeof(ipv6_flag));
+		if (res != 0) { pt_fail_wsa("setsockopt(IPPROTO_IPV6)"); break; }
+
+		// Set the socket to be non-blocking
+		u_long nb_flag = 1;
+		res = ioctlsocket(s, FIONBIO, &nb_flag);
+		if (res != 0) { pt_fail_wsa("ioctlsocket(FIONBIO)"); break; }
+
+		struct sockaddr_in6 addr = { 0 };
+		addr.sin6_family = AF_INET6;
+		addr.sin6_addr = in6addr_any;
+		addr.sin6_port = htons(pt_opts->port);
+
+		res = bind(s, (struct sockaddr*)&addr, sizeof(addr));
+		if (res != 0) { pt_fail_wsa("bind()"); break; }
+
+		res = listen(s, (int)pt_opts->backlog);
+		if (res != 0) { pt_fail_wsa("listen()"); break; }
+
+		return s;
+
+	} while (false);
+
+	if (s != INVALID_SOCKET) closesocket(s);
+	return INVALID_SOCKET;
+}
+
+static os_socket os_socket_accept(os_socket listen_s)
+{
+	struct sockaddr_in6 addr;
+	int addr_len = sizeof(addr);
+	SOCKET s = accept(listen_s, (struct sockaddr*)&addr, &addr_len);
+	if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+	if (!os_imp_config_data_socket(s)) {
+		closesocket(s);
+		return INVALID_SOCKET;
+	}
+
+	return s;
+}
+
 static size_t os_socket_recv(os_socket s, void *data, size_t size)
 {
 	if (size > INT_MAX) size = INT_MAX;
@@ -941,7 +520,7 @@ static size_t os_socket_recv(os_socket s, void *data, size_t size)
 	if (res < 0) {
 		int err = WSAGetLastError();
 		if (err == WSAEWOULDBLOCK) return 0;
-		t_err.function = "recv";
+		t_err.function = "recv()";
 		t_err.type = BQWS_PT_ERRTYPE_WSA;
 		t_err.data = err;
 		return SIZE_MAX;
@@ -957,7 +536,7 @@ static size_t os_socket_send(os_socket s, const void *data, size_t size)
 	if (res < 0) {
 		int err = WSAGetLastError();
 		if (err == WSAEWOULDBLOCK) return 0;
-		t_err.function = "send";
+		t_err.function = "send()";
 		t_err.type = BQWS_PT_ERRTYPE_WSA;
 		t_err.data = err;
 		return SIZE_MAX;
@@ -978,7 +557,7 @@ static void os_socket_close(os_socket s)
 
 // -- TLS
 
-#if 1
+#if BQWS_PT_USE_OPENSSL
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -990,6 +569,10 @@ typedef struct {
 
 typedef struct {
 	SSL_CTX *ctx;
+} pt_tls_server;
+
+typedef struct {
+	SSL_CTX *client_ctx;
 } pt_tls_global;
 
 static pt_tls_global g_tls;
@@ -1007,31 +590,31 @@ static bool tls_init(const bqws_pt_init_opts *opts)
 
 	SSL_library_init();
 
-	g_tls.ctx = SSL_CTX_new(SSLv23_method());
-	if (!g_tls.ctx) { pt_fail_ssl("SSL_CTX_new"); return false; }
+	g_tls.client_ctx = SSL_CTX_new(SSLv23_client_method());
+	if (!g_tls.client_ctx) { pt_fail_ssl("SSL_CTX_new()"); return false; }
 
 	if (opts->ca_filename) {
-		res = SSL_CTX_load_verify_locations(g_tls.ctx, opts->ca_filename, NULL);
-		if (!res) { pt_fail_ssl("SSL_CTX_load_verify_locations"); return false; }
+		res = SSL_CTX_load_verify_locations(g_tls.client_ctx, opts->ca_filename, NULL);
+		if (!res) { pt_fail_ssl("SSL_CTX_load_verify_locations()"); return false; }
 	}
 
 	long flags = SSL_OP_NO_COMPRESSION;
-	SSL_CTX_set_options(g_tls.ctx, flags);
+	SSL_CTX_set_options(g_tls.client_ctx, flags);
 
 	long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
-	SSL_CTX_set_mode(g_tls.ctx, mode);
+	SSL_CTX_set_mode(g_tls.client_ctx, mode);
 
 	return true;
 }
 
 static void tls_shutdown()
 {
-	SSL_CTX_free(g_tls.ctx);
+	SSL_CTX_free(g_tls.client_ctx);
 }
 
 static bool tls_init_client(pt_tls *tls, os_socket s, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
 {
-	tls->ssl = SSL_new(g_tls.ctx);
+	tls->ssl = SSL_new(g_tls.client_ctx);
 	if (!tls->ssl) return false;
 
 	BIO *bio = BIO_new_socket((int)s, 0);
@@ -1053,10 +636,51 @@ static bool tls_init_client(pt_tls *tls, os_socket s, const bqws_pt_connect_opts
 	return true;
 }
 
-static bool tls_init_server(pt_tls *tls, const bqws_pt_listen_opts *pt_opts)
+static bool tls_init_server(pt_tls_server *tls, const bqws_pt_listen_opts *pt_opts)
 {
-	// TODO:
-	return false;
+	tls->ctx = SSL_CTX_new(SSLv23_server_method());
+	if (!tls->ctx) { pt_fail_ssl("SSL_CTX_new()"); return false; }
+
+	int res;
+
+	if (pt_opts->certificate_file) {
+		res = SSL_CTX_use_certificate_file(tls->ctx, pt_opts->certificate_file, SSL_FILETYPE_PEM);
+		if (!res) { pt_fail_ssl("SSL_CTX_use_certificate_file()"); return false; }
+	}
+
+	if (pt_opts->private_key_file) {
+		res = SSL_CTX_use_PrivateKey_file(tls->ctx, pt_opts->private_key_file, SSL_FILETYPE_PEM);
+		if (!res) { pt_fail_ssl("SSL_CTX_use_PrivateKey_file()"); return false; }
+	}
+
+	long flags = SSL_OP_NO_COMPRESSION;
+	SSL_CTX_set_options(tls->ctx, flags);
+
+	long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
+	SSL_CTX_set_mode(tls->ctx, mode);
+
+	return true;
+}
+
+static void tls_free_server(pt_tls_server *tls)
+{
+	if (tls->ctx) {
+		SSL_CTX_free(tls->ctx);
+	}
+}
+
+static bool tls_init_accept(pt_tls *tls, pt_tls_server *tls_server, os_socket s)
+{
+	tls->ssl = SSL_new(tls_server->ctx);
+	if (!tls->ssl) return false;
+
+	BIO *bio = BIO_new_socket((int)s, 0);
+	if (!bio) return false;
+
+	// SSL_free() will free the BIO internally
+	SSL_set_bio(tls->ssl, bio, bio);
+
+	return true;
 }
 
 static void tls_free(pt_tls *tls)
@@ -1073,7 +697,7 @@ static bool tls_imp_connect(pt_tls *tls)
 			// Did not fail, just did not connect yet
 			return true;
 		} else {
-			pt_fail_ssl("SSL_connect");
+			pt_fail_ssl("SSL_connect()");
 			return false;
 		}
 	}
@@ -1095,7 +719,7 @@ static size_t tls_send(pt_tls *tls, const void *data, size_t size)
 		if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
 			return 0;
 		} else {
-			pt_fail_ssl("SSL_write");
+			pt_fail_ssl("SSL_write()");
 			return SIZE_MAX;
 		}
 	}
@@ -1116,7 +740,7 @@ static size_t tls_recv(pt_tls *tls, void *data, size_t size)
 		if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
 			return 0;
 		} else {
-			pt_fail_ssl("SSL_read");
+			pt_fail_ssl("SSL_read()");
 			return SIZE_MAX;
 		}
 	}
@@ -1129,6 +753,10 @@ typedef struct {
 	int unused;
 } pt_tls;
 
+typedef struct {
+	int unused;
+} pt_tls_server;
+
 static bool tls_init(const bqws_pt_init_opts *opts)
 {
 	return true;
@@ -1136,19 +764,19 @@ static bool tls_init(const bqws_pt_init_opts *opts)
 
 static bool tls_init_socket(pt_tls *tls)
 {
-	pt_fail_pt("tls_init_socket", BQWS_PT_ERR_NO_TLS);
+	pt_fail_pt("tls_init_socket()", BQWS_PT_ERR_NO_TLS);
 	return false;
 }
 
 static bool tls_init_client(pt_tls *tls, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
 {
-	pt_fail_pt("tls_init_client", BQWS_PT_ERR_NO_TLS);
+	pt_fail_pt("tls_init_client()", BQWS_PT_ERR_NO_TLS);
 	return false;
 }
 
-static bool tls_init_server(pt_tls *tls, const bqws_pt_listen_opts *pt_opts)
+static bool tls_init_server(pt_tls *tls, pt_tls_server *tls_server, os_socket s)
 {
-	pt_fail_pt("tls_init_server", BQWS_PT_ERR_NO_TLS);
+	pt_fail_pt("tls_init_server()", BQWS_PT_ERR_NO_TLS);
 	return false;
 }
 
@@ -1176,6 +804,12 @@ typedef struct {
 	bool secure;
 	pt_tls tls;
 } pt_io;
+
+struct bqws_pt_server {
+	os_socket s;
+	bool secure;
+	pt_tls_server tls;
+};
 
 static size_t io_imp_send(pt_io *io, const void *data, size_t size)
 {
@@ -1344,22 +978,84 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 	} while (false);
 
 	if (io) io_free(io);
-	if (s) os_socket_close(s);
+	if (s != OS_BAD_SOCKET) os_socket_close(s);
 	return NULL;
 }
 
-static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *opts)
+static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *pt_opts)
 {
-	return NULL;
+	bqws_pt_server *sv = (bqws_pt_server*)malloc(sizeof(bqws_pt_server));
+	if (!sv) { pt_fail_pt("pt_listen()", BQWS_PT_ERR_OUT_OF_MEMORY); return NULL; }
+	memset(sv, 0, sizeof(bqws_pt_server));
+
+	if (pt_opts->secure) {
+		sv->secure = true;
+		if (!tls_init_server(&sv->tls, pt_opts)) {
+			free(sv);
+			return NULL;
+		}
+	}
+
+	sv->s = os_socket_listen(pt_opts);
+	if (sv->s == OS_BAD_SOCKET) {
+		free(sv);
+		return NULL;
+	}
+
+	return sv;
 }
 
 static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const bqws_server_opts *server_opts)
 {
+	os_socket s = os_socket_accept(sv->s);
+	if (s == OS_BAD_SOCKET) return NULL;
+
+	pt_io *io = NULL;
+
+	do {
+		io = malloc(sizeof(pt_io));
+		if (!io) break;
+
+		memset(io, 0, sizeof(pt_io));
+		io->s = s;
+
+		if (sv->secure) {
+			io->secure = true;
+			if (!tls_init_accept(&io->tls, &sv->tls, s)) return false;
+		}
+
+		bqws_opts opt;
+		if (opts) {
+			opt = *opts;
+		} else {
+			memset(&opt, 0, sizeof(opt));
+		}
+
+		opt.io.user = io;
+		opt.io.send_fn = &pt_io_send;
+		opt.io.recv_fn = &pt_io_recv;
+		opt.io.flush_fn = &pt_io_flush;
+		opt.io.close_fn = &pt_io_close;
+
+		bqws_socket *ws = bqws_new_server(&opt, server_opts);
+		if (!ws) break;
+
+		return ws;
+
+	} while (false);
+
+	if (io) free(io);
+	os_socket_close(s);
 	return NULL;
 }
 
 static void pt_free_server(bqws_pt_server *sv)
 {
+	if (sv->secure) {
+		tls_free_server(&sv->tls);
+	}
+	os_socket_close(sv->s);
+	free(sv);
 }
 
 #else
@@ -1402,13 +1098,20 @@ bool bqws_pt_get_error(bqws_pt_error *err)
 
 bqws_socket *bqws_pt_connect(const char *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
 {
+	bqws_pt_clear_error();
+
 	bqws_url parsed_url;
-	if (!bqws_parse_url(&parsed_url, url)) return NULL;
+	if (!bqws_parse_url(&parsed_url, url)) {
+		pt_fail_pt("bqws_parse_url()", BQWS_PT_ERR_BAD_URL);
+		return NULL;
+	}
 	return bqws_pt_connect_url(&parsed_url, pt_opts, opts, client_opts);
 }
 
 bqws_socket *bqws_pt_connect_url(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
 {
+	bqws_pt_clear_error();
+
 	bqws_pt_connect_opts popt;
 	if (pt_opts) {
 		popt = *pt_opts;
@@ -1438,6 +1141,8 @@ bqws_socket *bqws_pt_connect_url(const bqws_url *url, const bqws_pt_connect_opts
 
 bqws_pt_server *bqws_pt_listen(const bqws_pt_listen_opts *pt_opts)
 {
+	bqws_pt_clear_error();
+
 	bqws_pt_listen_opts opts;
 	if (pt_opts) {
 		opts = *pt_opts;
@@ -1464,5 +1169,76 @@ void bqws_pt_free_server(bqws_pt_server *sv)
 
 bqws_socket *bqws_pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const bqws_server_opts *server_opts)
 {
+	bqws_pt_clear_error();
+
 	return pt_accept(sv, opts, server_opts);
+}
+
+void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err)
+{
+	if (size == 0) return;
+
+	*dst = '\0';
+
+	switch (err->type) {
+	case BQWS_PT_ERRTYPE_NONE:
+		// Nop, empty description
+		break;
+	case BQWS_PT_ERRTYPE_PT:
+		{
+			const char *str = bqws_pt_error_code_str((bqws_pt_error_code)err->data);
+			size_t len = strlen(str);
+			if (len > size) len = size;
+			memcpy(dst, str, len);
+			dst[len] = '\0';
+		}
+		break;
+	case BQWS_PT_ERRTYPE_WSA:
+		#if defined(_WIN32)
+		{
+			wchar_t *buf;
+			FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, 
+				NULL, (DWORD)err->data,
+				MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				(LPWSTR)&buf, 0, NULL);
+
+			int int_size = size < INT_MAX ? (int)size : INT_MAX;
+			int res = WideCharToMultiByte(CP_UTF8, 0, buf, -1, dst, int_size, NULL, NULL);
+			if (res == 0) {
+				*dst = '\0';
+			} else if (res >= int_size) {
+				dst[int_size] = '\0';
+			}
+		}
+		#endif
+		break;
+	case BQWS_PT_ERRTYPE_OPENSSL:
+		#if BQWS_PT_USE_OPENSSL
+			ERR_error_string_n((unsigned long)err->data, dst, size);
+		#endif
+		break;
+	}
+}
+
+const char *bqws_pt_error_type_str(bqws_pt_error_type type)
+{
+	switch (type) {
+	case BQWS_PT_ERRTYPE_NONE: return "NONE";
+	case BQWS_PT_ERRTYPE_PT: return "PT";
+	case BQWS_PT_ERRTYPE_WSA: return "WSA";
+	case BQWS_PT_ERRTYPE_OPENSSL: return "OPENSSL";
+	default: return "(unknown)";
+	}
+}
+
+const char *bqws_pt_error_code_str(bqws_pt_error_code err)
+{
+	switch (err) {
+	case BQWS_PT_OK: return "OK";
+	case BQWS_PT_ERR_NO_TLS: return "NO_TLS";
+	case BQWS_PT_ERR_NO_SERVER_SUPPORT: return "NO_SERVER_SUPPORT";
+	case BQWS_PT_ERR_OUT_OF_MEMORY: return "OUT_OF_MEMORY";
+	case BQWS_PT_ERR_BAD_URL: return "BAD_URL";
+	default: return "(unknown)";
+	}
 }

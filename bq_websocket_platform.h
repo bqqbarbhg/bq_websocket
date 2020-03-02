@@ -27,6 +27,8 @@ typedef enum bqws_pt_error_code {
 	BQWS_PT_OK,
 	BQWS_PT_ERR_NO_TLS,
 	BQWS_PT_ERR_NO_SERVER_SUPPORT,
+	BQWS_PT_ERR_OUT_OF_MEMORY,
+	BQWS_PT_ERR_BAD_URL,
 } bqws_pt_error_code;
 
 typedef struct bqws_pt_error {
@@ -54,6 +56,10 @@ typedef struct bqws_pt_listen_opts {
 
 	// Use TLS for incoming connections
 	bool secure;
+
+	// TLS certificate, used only if `secure`
+	const char *certificate_file;
+	const char *private_key_file;
 
 	// Port to bind to
 	// default: 80 if `!secure`, 443 if `secure`
@@ -87,5 +93,12 @@ bqws_pt_server *bqws_pt_listen(const bqws_pt_listen_opts *pt_opts);
 void bqws_pt_free_server(bqws_pt_server *sv);
 
 bqws_socket *bqws_pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const bqws_server_opts *server_opts);
+
+// -- Utility
+
+void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err);
+
+const char *bqws_pt_error_type_str(bqws_pt_error_type type);
+const char *bqws_pt_error_code_str(bqws_pt_error_code err);
 
 #endif
