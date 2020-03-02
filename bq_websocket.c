@@ -30,6 +30,14 @@
 		});
 
 		#define bqws_cpu_time() (uint64_t)(bqws_js_perfnow() * 1e3)
+
+	#elif defined(__i386__) || defined(__x86_64__)
+
+		#include <x86intrin.h>
+		#include <xmmintrin.h>
+		#define BQWS_USE_SSE 1
+		#define bqws_cpu_time() (uint64_t)__rdtsc()
+
 	#endif
 
 #else

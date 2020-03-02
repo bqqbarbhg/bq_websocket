@@ -18,6 +18,14 @@ typedef enum bqws_pt_error_type {
 	// https://docs.microsoft.com/en-us/windows/win32/winsock/windows-sockets-error-codes-2
 	BQWS_PT_ERRTYPE_WSA,
 
+	// POSIX errno codes
+	// https://www-numi.fnal.gov/offline_software/srt_public_context/WebDocs/Errors/unix_system_errors.html
+	BQWS_PT_ERRTYPE_POSIX,
+
+	// getaddrinfo() error codes
+	// http://man7.org/linux/man-pages/man3/getaddrinfo.3.html
+	BQWS_PT_ERRTYPE_GETADDRINFO,
+
 	// OpenSSL error codes
 	BQWS_PT_ERRTYPE_OPENSSL,
 

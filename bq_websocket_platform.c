@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <stdio.h>
 
 // -- Generic
 
@@ -359,7 +360,6 @@ static void pt_free_server(bqws_pt_server *sv)
 
 #pragma comment(lib, "ws2_32.lib")
 
-
 typedef SOCKET os_socket;
 #define OS_BAD_SOCKET INVALID_SOCKET
 
@@ -552,7 +552,197 @@ static void os_socket_close(os_socket s)
 }
 
 #else
-	#error "TODO"
+
+#include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <netinet/tcp.h>
+
+// TODO: Guard this with macros?
+#if 1
+	#include <netdb.h>
+	#define BQWS_HAS_GAI_STRERROR
+#endif
+
+typedef int os_socket;
+#define OS_BAD_SOCKET -1
+
+static void pt_fail_posix(const char *func)
+{
+	t_err.function = func;
+	t_err.type = BQWS_PT_ERRTYPE_POSIX;
+	t_err.data = errno;
+}
+
+static bool os_init(const bqws_pt_init_opts *opts)
+{
+	return true;
+}
+
+static void os_shutdown()
+{
+}
+
+static bool os_imp_config_data_socket(os_socket s)
+{
+	int res;
+
+	// Set the socket to be non-blocking
+	int nb_flag = 1;
+	res = ioctl(s, FIONBIO, &nb_flag);
+	if (res != 0) { pt_fail_posix("ioctl(FIONBIO)"); return false; }
+
+	// Disable Nagle's algorithm to make writes immediate
+	int nd_flag = 1;
+	res = setsockopt(s, SOL_TCP, TCP_NODELAY, &nd_flag, sizeof(nd_flag));
+	if (res != 0) { pt_fail_posix("setsockopt(TCP_NODELAY)"); return false; }
+
+	return true;
+}
+
+static os_socket os_imp_try_connect(struct addrinfo *info, int family, struct addrinfo **used)
+{
+	for (; info; info = info->ai_next) {
+		if (info->ai_family != family) continue;
+
+		int s = socket(family, SOCK_STREAM, IPPROTO_TCP);
+		if (s == -1) { pt_fail_posix("socket()"); return s; }
+		int res = connect(s, info->ai_addr, (int)info->ai_addrlen);
+		if (res == 0) return s;
+		pt_fail_posix("connect()");
+		close(s);
+		*used = info;
+	}
+
+	return -1;
+}
+
+static os_socket os_socket_connect(const bqws_url *url)
+{
+	char service[64];
+	snprintf(service, sizeof(service), "%d", (int)url->port);
+
+	struct addrinfo hints = { 0 };
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_TCP;
+
+	struct addrinfo *info;
+	int res = getaddrinfo(url->host, service, &hints, &info);
+	if (res != 0) {
+		t_err.function = "getaddrinfo()";
+		t_err.type = BQWS_PT_ERRTYPE_GETADDRINFO;
+		t_err.data = res;
+		return -1;
+	}
+
+	struct addrinfo *used_info = NULL;
+	int s = os_imp_try_connect(info, AF_INET6, &used_info);
+	if (s == -1) {
+		s = os_imp_try_connect(info, AF_INET, &used_info);
+	}
+
+	// TODO: Retain address
+	freeaddrinfo(info);
+
+	if (!os_imp_config_data_socket(s)) {
+		close(s);
+		return -1;
+	}
+
+	return s;
+}
+
+static os_socket os_socket_listen(const bqws_pt_listen_opts *pt_opts)
+{
+	os_socket s = -1;
+	bqws_pt_server *sv = NULL;
+	int res;
+
+	do {
+		s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+		if (s == -1) { pt_fail_posix("socket()"); break; }
+
+		// Make sure the socket supports both IPv4 and IPv6
+		int ipv6_flag = 0;
+		res = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6_flag, sizeof(ipv6_flag));
+		if (res != 0) { pt_fail_posix("setsockopt(IPPROTO_IPV6)"); break; }
+
+		// Set the socket to be non-blocking
+		int nb_flag = 1;
+		res = ioctl(s, FIONBIO, &nb_flag);
+		if (res != 0) { pt_fail_posix("ioctl(FIONBIO)"); break; }
+
+		struct sockaddr_in6 addr = { 0 };
+		addr.sin6_family = AF_INET6;
+		addr.sin6_addr = in6addr_any;
+		addr.sin6_port = htons(pt_opts->port);
+
+		res = bind(s, (struct sockaddr*)&addr, sizeof(addr));
+		if (res != 0) { pt_fail_posix("bind()"); break; }
+
+		res = listen(s, (int)pt_opts->backlog);
+		if (res != 0) { pt_fail_posix("listen()"); break; }
+
+		return s;
+
+	} while (false);
+
+	if (s != -1) close(s);
+	return -1;
+}
+
+static os_socket os_socket_accept(os_socket listen_s)
+{
+	struct sockaddr_in6 addr;
+	socklen_t addr_len = sizeof(addr);
+	int s = accept(listen_s, (struct sockaddr*)&addr, &addr_len);
+	if (s == -1) return -1;
+
+	if (!os_imp_config_data_socket(s)) {
+		close(s);
+		return -1;
+	}
+
+	return s;
+}
+
+static size_t os_socket_recv(os_socket s, void *data, size_t size)
+{
+	int res = read(s, data, size);
+	if (res < 0) {
+		int err = errno;
+		if (err == EAGAIN || err == EWOULDBLOCK) return 0;
+		t_err.function = "read()";
+		t_err.type = BQWS_PT_ERRTYPE_POSIX;
+		t_err.data = err;
+		return SIZE_MAX;
+	}
+	return (size_t)res;
+}
+
+static size_t os_socket_send(os_socket s, const void *data, size_t size)
+{
+	int res = write(s, data, size);
+	if (res < 0) {
+		int err = errno;
+		if (err == EAGAIN || err == EWOULDBLOCK) return 0;
+		t_err.function = "write()";
+		t_err.type = BQWS_PT_ERRTYPE_POSIX;
+		t_err.data = err;
+		return SIZE_MAX;
+	}
+	return (size_t)res;
+}
+
+static void os_socket_close(os_socket s)
+{
+	shutdown(s, SHUT_RDWR);
+	close(s);
+}
+
 #endif
 
 // -- TLS
@@ -762,33 +952,44 @@ static bool tls_init(const bqws_pt_init_opts *opts)
 	return true;
 }
 
-static bool tls_init_socket(pt_tls *tls)
+static void tls_shutdown()
 {
-	pt_fail_pt("tls_init_socket()", BQWS_PT_ERR_NO_TLS);
-	return false;
 }
 
-static bool tls_init_client(pt_tls *tls, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
+static bool tls_init_client(pt_tls *tls, os_socket s, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
 {
 	pt_fail_pt("tls_init_client()", BQWS_PT_ERR_NO_TLS);
 	return false;
 }
 
-static bool tls_init_server(pt_tls *tls, pt_tls_server *tls_server, os_socket s)
+static bool tls_init_server(pt_tls_server *tls, const bqws_pt_listen_opts *pt_opts)
 {
-	pt_fail_pt("tls_init_server()", BQWS_PT_ERR_NO_TLS);
+	pt_fail_pt("tls_init_client()", BQWS_PT_ERR_NO_TLS);
 	return false;
+}
+
+static void tls_free_server(pt_tls_server *tls)
+{
+}
+
+static bool tls_init_accept(pt_tls *tls, pt_tls_server *tls_server, os_socket s)
+{
+	assert(0 && "Should never get here");
+}
+
+static void tls_free(pt_tls *tls)
+{
 }
 
 static size_t tls_send(pt_tls *tls, const void *data, size_t size)
 {
-	assert(0 && "Shouldn't get here");
+	assert(0 && "Should never get here");
 	return SIZE_MAX;
 }
 
-static size_t tls_recv(pt_tls *tls, const void *data, size_t size)
+static size_t tls_recv(pt_tls *tls, void *data, size_t size)
 {
-	assert(0 && "Shouldn't get here");
+	assert(0 && "Should never get here");
 	return SIZE_MAX;
 }
 
@@ -1181,9 +1382,11 @@ void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err)
 	*dst = '\0';
 
 	switch (err->type) {
+
 	case BQWS_PT_ERRTYPE_NONE:
 		// Nop, empty description
 		break;
+
 	case BQWS_PT_ERRTYPE_PT:
 		{
 			const char *str = bqws_pt_error_code_str((bqws_pt_error_code)err->data);
@@ -1193,6 +1396,7 @@ void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err)
 			dst[len] = '\0';
 		}
 		break;
+
 	case BQWS_PT_ERRTYPE_WSA:
 		#if defined(_WIN32)
 		{
@@ -1212,11 +1416,33 @@ void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err)
 		}
 		#endif
 		break;
+
+	case BQWS_PT_ERRTYPE_POSIX:
+		#if defined(_WIN32)
+			strerror_s(dst, size, (int)err->data);
+		#else
+			strerror_r((int)err->data, dst, size);
+		#endif
+		break;
+
+	case BQWS_PT_ERRTYPE_GETADDRINFO:
+		#if defined(BQWS_HAS_GAI_STRERROR)
+		{
+			const char *str = gai_strerror((int)err->data);
+			size_t len = strlen(str);
+			if (len > size) len = size;
+			memcpy(dst, str, len);
+			dst[len] = '\0';
+		}
+		#endif
+		break;
+
 	case BQWS_PT_ERRTYPE_OPENSSL:
 		#if BQWS_PT_USE_OPENSSL
 			ERR_error_string_n((unsigned long)err->data, dst, size);
 		#endif
 		break;
+
 	}
 }
 
@@ -1226,6 +1452,8 @@ const char *bqws_pt_error_type_str(bqws_pt_error_type type)
 	case BQWS_PT_ERRTYPE_NONE: return "NONE";
 	case BQWS_PT_ERRTYPE_PT: return "PT";
 	case BQWS_PT_ERRTYPE_WSA: return "WSA";
+	case BQWS_PT_ERRTYPE_POSIX: return "POSIX";
+	case BQWS_PT_ERRTYPE_GETADDRINFO: return "GETADDRINFO";
 	case BQWS_PT_ERRTYPE_OPENSSL: return "OPENSSL";
 	default: return "(unknown)";
 	}

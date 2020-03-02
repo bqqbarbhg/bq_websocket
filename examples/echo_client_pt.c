@@ -10,6 +10,9 @@
 	#define os_sleep() Sleep(10)
 #elif defined(__EMSCRIPTEN__)
 	#include <emscripten.h>
+#else
+	 #include <unistd.h>
+	#define os_sleep() usleep(10000)
 #endif
 
 bqws_socket *ws;
@@ -20,6 +23,18 @@ size_t counter;
 static void log(void *user, bqws_socket *ws, const char *line)
 {
 	printf("@@ %s\n", line);
+}
+
+static void log_pt_error()
+{
+	bqws_pt_error err;
+	if (bqws_pt_get_error(&err)) {
+		char desc[256];
+		bqws_pt_get_error_desc(desc, sizeof(desc), &err);
+		fprintf(stderr, "%s %s error %d / 0x%08x\n%s\n",
+			err.function, bqws_pt_error_type_str(err.type),
+			(int)err.data, (unsigned)err.data, desc);
+	}
 }
 
 void main_loop()
@@ -53,6 +68,8 @@ void main_loop()
 	if (bqws_is_closed(ws)) {
 		bqws_free_socket(ws);
 		ws = NULL;
+
+		log_pt_error();
 	}
 }
 
@@ -60,12 +77,21 @@ int main(int argc, char **argv)
 {
 	bqws_pt_init_opts init_opts = { 0 };
 	init_opts.ca_filename = "cacert.pem";
-	bqws_pt_init(&init_opts);
+	if (!bqws_pt_init(&init_opts)) {
+		fprintf(stderr, "bqws_pt_init() failed\n");
+		log_pt_error();
+		return 1;
+	}
 
 	bqws_opts opts = { 0 };
 	opts.log_fn = &log;
 
 	ws = bqws_pt_connect("wss://demos.kaazing.com/echo", NULL, &opts, NULL);
+	if (!ws) {
+		fprintf(stderr, "bqws_pt_connect() failed\n");
+		log_pt_error();
+		return 1;
+	}
 
 	bqws_send_text(ws, "Hello world!");
 
