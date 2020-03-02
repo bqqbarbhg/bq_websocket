@@ -18,13 +18,29 @@
 		#define bqws_cpu_time() (uint64_t)__rdtsc()
 	#endif
 
-#elif deined(__GNUC__) || defined(__clang__)
+
+#elif defined(__GNUC__) || defined(__clang__)
 	#define bqws_forceinline __attribute__((always_inline))
+
+	#if defined(__EMSCRIPTEN__)
+		#include <emscripten/em_js.h>
+
+		EM_JS(double, bqws_js_perfnow, (void), {
+			return performance.now();
+		});
+
+		#define bqws_cpu_time() (uint64_t)(bqws_js_perfnow() * 1e3)
+	#endif
+
 #else
 	#define bqws_forceinline
 #endif
 
-#define bqws_assert(x) do { if (!(x)) __debugbreak(); } while (0)
+#ifndef bqws_assert
+#include <assert.h>
+#define bqws_assert(x) assert(x)
+#endif
+
 
 // TODO: QueryPerformanceCounter() or clock_gettime() might be faster
 typedef clock_t bqws_timestamp;
@@ -181,6 +197,8 @@ struct bqws_socket {
 	void *peek_user;
 	bqws_log_fn *log_fn;
 	void *log_user;
+	bqws_send_message_fn *send_message_fn;
+	void *send_message_user;
 	size_t user_size;
 	size_t ping_interval;
 	size_t close_timeout;
@@ -205,6 +223,7 @@ struct bqws_socket {
 
 		// Connection state
 		bqws_state state;
+		bqws_state override_state;
 
 		// Pre-allocated error close message storage
 		char error_msg_data[sizeof(bqws_msg_imp) + sizeof(bqws_err_close_data)];
@@ -1007,8 +1026,8 @@ static bool streq_ic(const char *sa, const char *sb)
 {
 	for (;;) {
 		char a = *sa++, b = *sb++;
-		if (a < 0x80) a = tolower(a);
-		if (b < 0x80) b = tolower(b);
+		if ((unsigned)(unsigned char)a < 0x80u) a = tolower(a);
+		if ((unsigned)(unsigned char)b < 0x80u) b = tolower(b);
 		if (a != b) return false;
 		if (a == 0) return true;
 	}
@@ -1569,7 +1588,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 		if (buf->header_offset < buf->header_size) return false;
 
 		// Parse the header and allocate the message
-		const uint8_t *h = ws->io.recv_header;
+		const uint8_t *h = (const uint8_t*)ws->io.recv_header;
 
 		// Static header bits
 		bool fin = (h[0] & 0x80) != 0;
@@ -1613,7 +1632,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 			h += 4;
 		}
 
-		bqws_assert(h - ws->io.recv_header == buf->header_size);
+		bqws_assert((const char*)h - ws->io.recv_header == buf->header_size);
 
 		bqws_msg_type type = BQWS_MSG_INVALID;
 
@@ -1901,6 +1920,18 @@ static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 		ws->peek_fn(ws->peek_user, ws, &msg->msg, false);
 	}
 
+	if (ws->send_message_fn) {
+		msg_release_ownership(ws, msg);
+		if (ws->send_message_fn(ws->send_message_user, ws, &msg->msg)) {
+			ws_log2(ws, "Direct send: ", bqws_msg_type_str(msg->msg.type));
+			buf->msg = NULL;
+			return true;
+		} else {
+			msg_acquire_ownership(ws, msg);
+			return false;
+		}
+	}
+
 	if (ws->ping_interval != SIZE_MAX) {
 		ws->io.last_write_ts = bqws_get_timestamp();
 	}
@@ -1955,7 +1986,7 @@ static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 			payload_ext = 2;
 		}
 
-		uint8_t *h = ws->io.send_header;
+		uint8_t *h = (uint8_t*)ws->io.send_header;
 		// Static header bits
 		h[0] = (fin ? 0x80 : 0x0) | (uint8_t)opcode;
 		h[1] = (mask ? 0x80 : 0x0) | (uint8_t)payload_len;
@@ -1981,7 +2012,7 @@ static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 			mask_apply(msg->msg.data, msg->msg.size, mask_key);
 		}
 
-		buf->header_size = h - ws->io.send_header;
+		buf->header_size = (char*)h - ws->io.send_header;
 		bqws_assert(buf->header_size <= sizeof(ws->io.send_header));
 	}
 
@@ -2119,6 +2150,8 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 	ws->peek_user = opts->peek_user;
 	ws->log_fn = opts->log_fn;
 	ws->log_user = opts->log_user;
+	ws->send_message_fn = opts->send_message_fn;
+	ws->send_message_user = opts->send_message_user;
 	ws->user_size = opts->user_size;
 
 	ws_expand_default_limits(&ws->limits);
@@ -2166,6 +2199,7 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 		ws->state.state = BQWS_STATE_OPEN;
 	} else {
 		ws_log(ws, "State: CONNECTING");
+		ws->state.state = BQWS_STATE_CONNECTING;
 	}
 
 	if (ws->err) {
@@ -2390,7 +2424,10 @@ bqws_state bqws_get_state(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	// No mutex! We can always underestimate the state
-	return ws->state.state;
+	bqws_state state = ws->state.state;
+	bqws_state override_state = ws->state.override_state;
+	if (override_state > state) state = override_state;
+	return state;
 }
 
 bqws_error bqws_get_error(const bqws_socket *ws)
@@ -2403,7 +2440,10 @@ bool bqws_is_closed(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	// No mutex! We can always underestimate the state
-	return ws->state.state == BQWS_STATE_CLOSED;
+	bqws_state state = ws->state.state;
+	bqws_state override_state = ws->state.override_state;
+	if (override_state > state) state = override_state;
+	return state == BQWS_STATE_CLOSED;
 }
 
 size_t bqws_get_memory_used(const bqws_socket *ws)
@@ -2508,6 +2548,7 @@ void bqws_send(bqws_socket *ws, bqws_msg_type type, const void *data, size_t siz
 	if (ws->err) return;
 	bqws_assert(size == 0 || data);
 
+
 	bqws_msg_imp *imp = msg_alloc(ws, type, size);
 	if (!imp) return;
 
@@ -2546,11 +2587,11 @@ bqws_msg *bqws_allocate_msg(bqws_socket *ws, bqws_msg_type type, size_t size)
 void bqws_send_msg(bqws_socket *ws, bqws_msg *msg)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	bqws_assert(msg->type == BQWS_MSG_TEXT || msg->type == BQWS_MSG_BINARY);
+	bqws_assert(msg && msg->type == BQWS_MSG_TEXT || msg->type == BQWS_MSG_BINARY);
 	bqws_assert(msg->size <= msg->capacity);
 
 	bqws_msg_imp *imp = msg_imp(msg);
-	bqws_assert(imp && imp->magic == BQWS_MSG_MAGIC);
+	bqws_assert(imp->magic == BQWS_MSG_MAGIC);
 
 	if (ws->err) return;
 
@@ -2862,6 +2903,34 @@ size_t bqws_write_to(bqws_socket *ws, void *data, size_t size)
 	return s.ptr - (char*)data;
 }
 
+void bqws_direct_push_msg(bqws_socket *ws, bqws_msg *msg)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	bqws_assert(msg && msg->size <= msg->capacity);
+
+	bqws_msg_imp *imp = msg_imp(msg);
+	bqws_assert(imp->magic == BQWS_MSG_MAGIC);
+
+	if (ws->err) return;
+
+	if (!msg_acquire_ownership(ws, imp)) return;
+
+	ws_log2(ws, "Direct recv: ", bqws_msg_type_str(msg->type));
+
+	ws_enqueue_recv(ws, imp);
+}
+
+void bqws_direct_set_override_state(bqws_socket *ws, bqws_state state)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+
+	ws_log2(ws, "Override state: ", bqws_state_str(state));
+
+	bqws_mutex_lock(&ws->state.mutex);
+	ws->state.override_state = state;
+	bqws_mutex_unlock(&ws->state.mutex);
+}
+
 bool bqws_parse_url(bqws_url *url, const char *str)
 {
 	// Format [wss://][host.example.com][:1234][/path]
@@ -2952,6 +3021,18 @@ const char *bqws_msg_type_str(bqws_msg_type type)
 	case BQWS_MSG_CONTROL_CLOSE: return "CONTROL_CLOSE";
 	case BQWS_MSG_CONTROL_PING: return "CONTROL_PING";
 	case BQWS_MSG_CONTROL_PONG: return "CONTROL_PONG";
+	default: return "(unknown)";
+	}
+}
+
+const char *bqws_state_str(bqws_state state)
+{
+	switch (state) {
+	case BQWS_STATE_INVALID: return "INVALID";
+	case BQWS_STATE_CONNECTING: return "CONNECTING";
+	case BQWS_STATE_OPEN: return "OPEN";
+	case BQWS_STATE_CLOSING: return "CLOSING";
+	case BQWS_STATE_CLOSED: return "CLOSED";
 	default: return "(unknown)";
 	}
 }

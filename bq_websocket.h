@@ -44,6 +44,7 @@ typedef enum bqws_error {
 } bqws_error;
 
 typedef enum bqws_state {
+	BQWS_STATE_INVALID,
 	BQWS_STATE_CONNECTING,
 	BQWS_STATE_OPEN,
 	BQWS_STATE_CLOSING,
@@ -126,6 +127,7 @@ typedef bool bqws_io_flush_fn(void *user, bqws_socket *ws);
 typedef void bqws_io_close_fn(void *user, bqws_socket *ws);
 
 typedef bool bqws_message_fn(void *user, bqws_socket *ws, bqws_msg *msg);
+typedef bool bqws_send_message_fn(void *user, bqws_socket *ws, bqws_msg *msg);
 typedef void bqws_peek_fn(void *user, bqws_socket *ws, bqws_msg *msg, bool received);
 typedef void bqws_log_fn(void *user, bqws_socket *ws, const char *line);
 
@@ -178,6 +180,10 @@ typedef struct bqws_opts {
 	// Verbose log of all events for this socket
 	bqws_log_fn *log_fn;
 	void *log_user;
+
+	// Send messages manually without IO
+	bqws_send_message_fn *send_message_fn;
+	void *send_message_user;
 
 	// User data block, if `user_size > 0` but `user_data == NULL`
 	// the data will be zero-initialized
@@ -243,8 +249,8 @@ typedef struct bqws_client_opts {
 	size_t num_headers;
 
 	// Random seed
-	uint8_t random_key[16];
-	uint8_t random_key_base64[32];
+	char random_key[16];
+	char random_key_base64[32];
 
 } bqws_client_opts;
 
@@ -343,11 +349,16 @@ void bqws_update_io_write(bqws_socket *ws);
 size_t bqws_read_from(bqws_socket *ws, const void *data, size_t size);
 size_t bqws_write_to(bqws_socket *ws, void *data, size_t size);
 
+// Direct control
+void bqws_direct_push_msg(bqws_socket *ws, bqws_msg *msg);
+void bqws_direct_set_override_state(bqws_socket *ws, bqws_state state);
+
 // -- Utility
 
 bool bqws_parse_url(bqws_url *url, const char *str);
 
 const char *bqws_error_str(bqws_error error);
 const char *bqws_msg_type_str(bqws_msg_type type);
+const char *bqws_state_str(bqws_state state);
 
 #endif
