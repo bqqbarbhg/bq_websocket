@@ -1360,7 +1360,12 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 		}
 
 		// Echo the close message back
-		ws->state.close_to_send = msg;
+		if (!ws->state.close_to_send) {
+			ws->state.close_to_send = msg;
+
+			// Don't free the message as it will be re-sent
+			msg = NULL;
+		}
 
 		// Peer has closed connection so we go directly to CLOSED
 		if (ws->state.state == BQWS_STATE_OPEN) {
@@ -1376,9 +1381,6 @@ static void ws_handle_control(bqws_socket *ws, bqws_msg_imp *msg)
 		}
 
 		bqws_mutex_unlock(&ws->state.mutex);
-
-		// Don't free the message as it will be re-sent
-		msg = NULL;
 
 	} else if (type == BQWS_MSG_CONTROL_PING) {
 		if (ws->recv_control_messages) {
