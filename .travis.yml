@@ -1,0 +1,19 @@
+sudo: false
+
+language: cpp
+compiler: clang
+
+script:
+    - mkdir -p build
+    - cd build
+    - clang -coverage -g -std=gnu99 -Wno-unused-value -D_GNU_SOURCE ../bq_websocket.c ../test/test_self.c -o test_self_push
+    - clang -coverage -g -std=gnu99 -Wno-unused-value -DTEST_PULL -D_GNU_SOURCE ../bq_websocket.c ../test/test_self.c -o test_self_pull
+    - ./test_self_push
+    - ./test_self_pull
+    - llvm-cov gcov test_self_push
+    - llvm-cov gcov test_self_pull
+    - cp bq_websocket.c.gcov ../bq_websocket.c.gcov
+    - rm *.gcov
+
+after_success:
+    - bash <(curl -s https://codecov.io/bash) -X gcov
