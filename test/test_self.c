@@ -58,6 +58,25 @@ int main(int argc, char **argv)
 	bqws_send_ping(client, "ClientPing", strlen("ClientPing"));
 	bqws_send_ping(server, "ServerPing", strlen("ServerPing"));
 
+	size_t big_size = 126;
+	size_t huge_size = 65536;
+
+	{
+		uint8_t data[128];
+		for (size_t i = 0; i < big_size; i++) {
+			data[i] = (uint8_t)((((i*i)>>8)+i));
+		}
+		bqws_send_binary(client, data, big_size);
+	}
+
+	{
+		bqws_msg *msg = bqws_allocate_msg(server, BQWS_MSG_BINARY, huge_size);
+		for (size_t i = 0; i < huge_size; i++) {
+			msg->data[i] = (uint8_t)((((i*i)>>16)+i));
+		}
+		bqws_send_msg(server, msg);
+	}
+
 	for (size_t i = 0; i < 10; i++) {
 		bqws_update(client);
 		bqws_update(server);
@@ -83,6 +102,29 @@ int main(int argc, char **argv)
 		test_check(!strcmp(msg->data, "Hello Server"));
 		bqws_free_msg(msg);
 	}
+
+	{
+		bqws_msg *msg = bqws_recv(client);
+		test_check(msg);
+		test_check(msg->type == BQWS_MSG_BINARY);
+		test_check(msg->size == huge_size);
+		for (size_t i = 0; i < huge_size; i++) {
+			test_check((uint8_t)msg->data[i] == (uint8_t)((((i*i)>>16)+i)));
+		}
+		bqws_free_msg(msg);
+	}
+
+	{
+		bqws_msg *msg = bqws_recv(server);
+		test_check(msg);
+		test_check(msg->type == BQWS_MSG_BINARY);
+		test_check(msg->size == big_size);
+		for (size_t i = 0; i < big_size; i++) {
+			test_check((uint8_t)msg->data[i] == (uint8_t)((((i*i)>>8)+i)));
+		}
+		bqws_free_msg(msg);
+	}
+
 
 	test_check(bqws_recv(client) == NULL);
 	test_check(bqws_recv(server) == NULL);
