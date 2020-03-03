@@ -28,6 +28,8 @@ int main(int argc, char **argv)
 	shared_opts.log_send = true;
 	shared_opts.log_recv = true;
 
+	printf("  Client                                    Server\n");
+
 	{
 		bqws_opts opts = shared_opts;
 		opts.io.user = &client;
@@ -47,7 +49,14 @@ int main(int argc, char **argv)
 	bqws_server_accept(server, NULL);
 
 	bqws_send_text(client, "Hello Server");
-	bqws_send_text(server, "Hello Client");
+
+	bqws_send_begin(server, BQWS_MSG_TEXT);
+	bqws_send_append_str(server, "Hello ");
+	bqws_send_append_str(server, "Client");
+	bqws_send_finish(server);
+
+	bqws_send_ping(client, "ClientPing", strlen("ClientPing"));
+	bqws_send_ping(server, "ServerPing", strlen("ServerPing"));
 
 	for (size_t i = 0; i < 10; i++) {
 		bqws_update(client);

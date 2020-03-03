@@ -8,7 +8,8 @@
 static void test_log_fn(void *user, bqws_socket *ws, const char *line)
 {
 	const char *name = bqws_get_name(ws);
-	printf("%s: %s\n", name, line);
+	const char *indent = !strcmp(name, "Server") ? "                                        " : "";
+	printf("%s%s\n", indent, line);
 }
 
 static void test_fail(const char *desc, const char *file, long line)
