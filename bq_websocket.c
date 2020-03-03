@@ -127,6 +127,12 @@ struct bqws_msg_imp {
 typedef struct {
 	bqws_mutex mutex;
 	bqws_msg_imp *first, *last;
+
+	size_t num_messages;
+	size_t byte_size;
+
+	uint64_t total_messages;
+	uint64_t total_size;
 } bqws_msg_queue;
 
 typedef struct {
@@ -205,6 +211,8 @@ struct bqws_socket {
 	void *peek_user;
 	bqws_log_fn *log_fn;
 	void *log_user;
+	bool log_send;
+	bool log_recv;
 	bqws_send_message_fn *send_message_fn;
 	void *send_message_user;
 	size_t user_size;
@@ -690,6 +698,12 @@ static void msg_enqueue(bqws_msg_queue *mq, bqws_msg_imp *msg)
 	}
 	mq->last = msg;
 
+	mq->byte_size += msg->msg.size;
+	mq->num_messages++;
+
+	mq->total_size += msg->msg.size;
+	mq->total_messages++;
+
 	bqws_mutex_unlock(&mq->mutex);
 }
 
@@ -712,6 +726,12 @@ static bqws_msg_imp *msg_dequeue(bqws_msg_queue *mq)
 			bqws_assert(mq->last == msg);
 			mq->last = NULL;
 		}
+
+		bqws_assert(mq->byte_size >= msg->msg.size);
+		bqws_assert(mq->num_messages > 0);
+		mq->byte_size -= msg->msg.size;
+		mq->num_messages--;
+
 	} else {
 		bqws_assert(!mq->last);
 	}
@@ -734,6 +754,27 @@ static void msg_free_queue(bqws_socket *ws, bqws_msg_queue *mq)
 	}
 
 	bqws_mutex_free(&mq->mutex);
+}
+
+static void msg_queue_add_to_total(bqws_msg_queue *mq, size_t size)
+{
+	bqws_mutex_lock(&mq->mutex);
+	mq->total_messages++;
+	mq->total_size += size;
+	bqws_mutex_unlock(&mq->mutex);
+}
+
+static void msg_queue_get_stats(bqws_msg_queue *mq, bqws_io_stats *stats)
+{
+	bqws_mutex_lock(&mq->mutex);
+
+	stats->total_bytes = mq->total_size;
+	stats->total_messages = mq->total_messages;
+
+	stats->queued_bytes = mq->byte_size;
+	stats->queued_messages = mq->num_messages;
+
+	bqws_mutex_unlock(&mq->mutex);
 }
 
 // Masking
@@ -1272,7 +1313,11 @@ static void ws_enqueue_recv(bqws_socket *ws, bqws_msg_imp *msg)
 	// enqueued to the receive queue.
 	if (ws->message_fn) {
 		msg_release_ownership(ws, msg);
-		if (ws->message_fn(ws->message_user, ws, &msg->msg)) return;
+		if (ws->message_fn(ws->message_user, ws, &msg->msg)) {
+			// Message was consumed and won't be processed so add
+			// it to the total count
+			msg_queue_add_to_total(&ws->recv_queue, msg->msg.size);
+		}
 		if (!msg_acquire_ownership(ws, msg)) return;
 	}
 
@@ -1533,6 +1578,12 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 	// Header has not been parsed yet
 	if (!buf->msg) {
 
+		// Check if we can fit a new message to the receive queue
+		if (ws->recv_queue.num_messages >= ws->limits.max_recv_queue_messages
+			|| ws->recv_queue.byte_size >= ws->limits.max_recv_queue_size) {
+			return false;
+		}
+
 		// We need to read at least two bytes to determine
 		// the header size
 		if (buf->header_size == 0) {
@@ -1626,7 +1677,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 		h += payload_ext;
 
 		// Check the payload length and cast to `size_t`
-		if (payload_length > (uint64_t)ws->limits.max_memory_used) {
+		if (payload_length > (uint64_t)ws->limits.max_recv_msg_size) {
 			ws_fail(ws, BQWS_ERR_LIMIT_MAX_RECV_MSG_SIZE);
 			return false;
 		}
@@ -1755,9 +1806,19 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 	// to the queue and clear the buffer.
 	bqws_msg_type type = msg->msg.type;
 
-	ws_log2(ws, "Received: ", bqws_msg_type_str(buf->msg->msg.type));
+	if (ws->log_recv) {
+		ws_log2(ws, "Received: ", bqws_msg_type_str(buf->msg->msg.type));
+	}
 
 	if ((type & BQWS_MSG_PARTIAL_BIT) != 0 && !ws->recv_partial_messages) {
+
+		// Only allow partial messages that combine up to the maximum message size
+		bqws_assert(msg->msg.size <= ws->limits.max_recv_msg_size);
+		if (ws->io.recv_partial_size >= ws->limits.max_recv_msg_size - msg->msg.size) {
+			ws_fail(ws, BQWS_ERR_LIMIT_MAX_RECV_MSG_SIZE);
+			return false;
+		}
+
 		ws->io.recv_partial_size += msg->msg.size;
 
 		// If we dont expose partial messages collect them to `recv_partial_queue`.
@@ -1796,6 +1857,12 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 			// Clear the partial total size
 			ws->io.recv_partial_size = 0;
 		} else {
+
+			if (ws->recv_partial_queue.num_messages >= ws->limits.max_partial_message_parts) {
+				ws_fail(ws, BQWS_ERR_LIMIT_MAX_PARTIAL_MESSAGE_PARTS);
+				return false;
+			}
+
 			msg_enqueue(&ws->recv_partial_queue, msg);
 		}
 
@@ -1930,7 +1997,9 @@ static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 	if (ws->send_message_fn) {
 		msg_release_ownership(ws, msg);
 		if (ws->send_message_fn(ws->send_message_user, ws, &msg->msg)) {
-			ws_log2(ws, "Direct send: ", bqws_msg_type_str(msg->msg.type));
+			if (ws->log_send) {
+				ws_log2(ws, "Direct send: ", bqws_msg_type_str(msg->msg.type));
+			}
 			buf->msg = NULL;
 			return true;
 		} else {
@@ -2049,7 +2118,9 @@ static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 		if (sent < to_send) return false;
 	}
 
-	ws_log2(ws, "Sent: ", bqws_msg_type_str(buf->msg->msg.type));
+	if (ws->log_send) {
+		ws_log2(ws, "Sent: ", bqws_msg_type_str(buf->msg->msg.type));
+	}
 
 	// Mark close as been sent
 	if (msg->msg.type == BQWS_MSG_CONTROL_CLOSE) {
@@ -2132,6 +2203,9 @@ static void ws_expand_default_limits(bqws_limits *limits)
 	WS_DEFAULT(max_memory_used, 262144);
 	WS_DEFAULT(max_recv_msg_size, 262144);
 	WS_DEFAULT(max_handshake_size, 262144);
+	WS_DEFAULT(max_recv_queue_messages, 1024);
+	WS_DEFAULT(max_recv_queue_size, 262144);
+	WS_DEFAULT(max_partial_message_parts, 16384);
 
 #undef WS_DEFAULT
 }
@@ -2162,6 +2236,8 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 	ws->peek_user = opts->peek_user;
 	ws->log_fn = opts->log_fn;
 	ws->log_user = opts->log_user;
+	ws->log_send = opts->log_send;
+	ws->log_recv = opts->log_recv;
 	ws->send_message_fn = opts->send_message_fn;
 	ws->send_message_user = opts->send_message_user;
 	ws->user_size = opts->user_size;
@@ -2511,6 +2587,32 @@ const char *bqws_get_name(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	return ws->name;
+}
+
+bqws_stats bqws_get_stats(const bqws_socket *ws)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+
+	bqws_stats stats;
+	msg_queue_get_stats((bqws_msg_queue*)&ws->recv_queue, &stats.recv);
+	msg_queue_get_stats((bqws_msg_queue*)&ws->send_queue, &stats.send);
+	return stats;
+}
+
+bqws_limits bqws_get_limits(const bqws_socket *ws)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	return ws->limits;
+}
+
+void bqws_set_limits(bqws_socket *ws, const bqws_limits *limits)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	bqws_assert(limits);
+
+	bqws_limits copy = *limits;
+	ws_expand_default_limits(&copy);
+	ws->limits = copy;
 }
 
 bqws_close_reason bqws_get_peer_close_reason(const bqws_socket *ws)
@@ -2950,7 +3052,9 @@ void bqws_direct_push_msg(bqws_socket *ws, bqws_msg *msg)
 
 	if (!msg_acquire_ownership(ws, imp)) return;
 
-	ws_log2(ws, "Direct recv: ", bqws_msg_type_str(msg->type));
+	if (ws->log_recv) {
+		ws_log2(ws, "Direct recv: ", bqws_msg_type_str(msg->type));
+	}
 
 	ws_enqueue_recv(ws, imp);
 }
@@ -3023,6 +3127,7 @@ const char *bqws_error_str(bqws_error error)
 	case BQWS_ERR_LIMIT_MAX_MEMORY_USED: return "LIMIT_MAX_MEMORY_USED";
 	case BQWS_ERR_LIMIT_MAX_RECV_MSG_SIZE: return "LIMIT_MAX_RECV_MSG_SIZE";
 	case BQWS_ERR_LIMIT_MAX_HANDSHAKE_SIZE: return "LIMIT_MAX_HANDSHAKE_SIZE";
+	case BQWS_ERR_LIMIT_MAX_PARTIAL_MESSAGE_PARTS: return "LIMIT_MAX_PARTIAL_MESSAGE_PARTS";
 	case BQWS_ERR_PING_TIMEOUT: return "BQWS_ERR_PING_TIMEOUT";
 	case BQWS_ERR_CLOSE_TIMEOUT: return "BQWS_ERR_CLOSE_TIMEOUT";
 	case BQWS_ERR_ALLOCATOR: return "ALLOCATOR";

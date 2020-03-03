@@ -20,6 +20,7 @@ typedef enum bqws_error {
 	BQWS_ERR_LIMIT_MAX_MEMORY_USED,
 	BQWS_ERR_LIMIT_MAX_RECV_MSG_SIZE,
 	BQWS_ERR_LIMIT_MAX_HANDSHAKE_SIZE,
+	BQWS_ERR_LIMIT_MAX_PARTIAL_MESSAGE_PARTS,
 
 	BQWS_ERR_PING_TIMEOUT,
 	BQWS_ERR_CLOSE_TIMEOUT,
@@ -161,6 +162,18 @@ typedef struct bqws_limits {
 	// default: 262144
 	size_t max_handshake_size;
 
+	// Maximum number of queued received messages
+	// default: 1024
+	size_t max_recv_queue_messages;
+
+	// Maximum size of queued received messages in bytes
+	// default: 262144
+	size_t max_recv_queue_size;
+
+	// Maximum number of parts in a chunked message
+	// default: 16384
+	size_t max_partial_message_parts;
+
 } bqws_limits;
 
 typedef struct bqws_opts {
@@ -180,6 +193,10 @@ typedef struct bqws_opts {
 	// Verbose log of all events for this socket
 	bqws_log_fn *log_fn;
 	void *log_user;
+
+	// Log also send/receive events
+	bool log_send;
+	bool log_recv;
 
 	// Send messages manually without IO
 	bqws_send_message_fn *send_message_fn;
@@ -277,13 +294,28 @@ typedef struct bqws_url {
 	const char *path;
 } bqws_url;
 
+typedef struct bqws_io_stats {
+	uint64_t total_messages;
+	uint64_t total_bytes;
+
+	size_t queued_messages;
+	size_t queued_bytes;
+} bqws_io_stats;
+
+typedef struct bqws_stats {
+	bqws_io_stats recv;
+	bqws_io_stats send;
+} bqws_stats;
+
 // -- WebSocket management
 
 bqws_socket *bqws_new_client(const bqws_opts *opts, const bqws_client_opts *client_opts);
 bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *server_opts);
+void bqws_free_socket(bqws_socket *ws);
+
+// Graceful shutdown
 void bqws_close(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size);
 void bqws_queue_close(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size);
-void bqws_free_socket(bqws_socket *ws);
 
 // -- Server connect
 
@@ -303,6 +335,11 @@ bool bqws_is_server(const bqws_socket *ws);
 void *bqws_user_data(const bqws_socket *ws);
 size_t bqws_user_data_size(const bqws_socket *ws);
 const char *bqws_get_name(const bqws_socket *ws);
+bqws_stats bqws_get_stats(const bqws_socket *ws);
+
+// Get/update limits
+bqws_limits bqws_get_limits(const bqws_socket *ws);
+void bqws_set_limits(bqws_socket *ws, const bqws_limits *limits);
 
 // Peer closing
 bqws_close_reason bqws_get_peer_close_reason(const bqws_socket *ws);

@@ -66,6 +66,10 @@ void main_loop()
 	}
 
 	if (bqws_is_closed(ws)) {
+		bqws_stats stats = bqws_get_stats(ws);
+		printf("Sent %zu messages: %zu bytes\n", (size_t)stats.send.total_messages, (size_t)stats.send.total_bytes);
+		printf("Received %zu messages: %zu bytes\n", (size_t)stats.recv.total_messages, (size_t)stats.recv.total_bytes);
+
 		bqws_free_socket(ws);
 		ws = NULL;
 
