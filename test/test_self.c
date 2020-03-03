@@ -4,6 +4,12 @@
 bqws_socket *client;
 bqws_socket *server;
 
+static size_t push_send(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size)
+{
+	bqws_socket *dst = *(bqws_socket**)user;
+	return bqws_read_from(dst, data, max_size);
+}
+
 static size_t pull_recv(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size)
 {
 	bqws_socket *src = *(bqws_socket**)user;
@@ -13,7 +19,11 @@ static size_t pull_recv(void *user, bqws_socket *ws, void *data, size_t max_size
 int main(int argc, char **argv)
 {
 	bqws_opts shared_opts = { 0 };
+#ifdef TEST_PULL
 	shared_opts.io.recv_fn = &pull_recv;
+#else
+	shared_opts.io.send_fn = &push_send;
+#endif
 	shared_opts.log_fn = &test_log_fn;
 	shared_opts.log_send = true;
 	shared_opts.log_recv = true;
