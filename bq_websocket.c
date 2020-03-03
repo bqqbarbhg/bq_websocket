@@ -3084,9 +3084,14 @@ bool bqws_parse_url(bqws_url *url, const char *str)
 	const char *scheme = str;
 	const char *scheme_end = strstr(scheme, "://");
 	const char *host = scheme_end ? scheme_end + 3 : scheme;
-	const char *port = strstr(host, ":");
-	const char *path = strstr(host, "/");
-	if (!path) path = host + strlen(host);
+	const char *port_start = host;
+	if (*host == '[') {
+		// Skip IPv6 address
+		port_start = strstr(host, "]");
+	}
+	const char *port = strstr(port_start, ":");
+	const char *path = strstr(port_start, "/");
+	if (!path) path = port_start + strlen(port_start);
 	if (port && port > path) port = NULL;
 	const char *host_end = port ? port : path;
 
