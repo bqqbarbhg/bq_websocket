@@ -97,6 +97,11 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	bqws_pt_address addr = bqws_pt_get_address(ws);
+	char addr_str[BQWS_PT_MAX_ADDRESS_FORMAT_LENGTH];
+	bqws_pt_format_address(addr_str, sizeof(addr_str), &addr);
+	printf("Connected to %s\n", addr_str);
+
 	bqws_send_text(ws, "Hello world!");
 
 	bqws_msg *msg = bqws_allocate_msg(ws, BQWS_MSG_TEXT, 4);

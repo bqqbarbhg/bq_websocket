@@ -6,6 +6,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#define BQWS_PT_MAX_ADDRESS_SIZE 16
+#define BQWS_PT_MAX_ADDRESS_FORMAT_LENGTH 64
+
 typedef struct bqws_pt_server bqws_pt_server;
 
 typedef enum bqws_pt_error_type {
@@ -44,6 +47,19 @@ typedef struct bqws_pt_error {
 	bqws_pt_error_type type;
 	int64_t data;
 } bqws_pt_error;
+
+typedef enum bqws_pt_address_type {
+	BQWS_PT_ADDRESS_UNKNOWN,
+	BQWS_PT_ADDRESS_WEBSOCKET,
+	BQWS_PT_ADDRESS_IPV4,
+	BQWS_PT_ADDRESS_IPV6,
+} bqws_pt_address_type;
+
+typedef struct bqws_pt_address {
+	bqws_pt_address_type type;
+	uint16_t port;
+	uint8_t address[BQWS_PT_MAX_ADDRESS_SIZE];
+} bqws_pt_address;
 
 typedef struct bqws_pt_init_opts {
 
@@ -102,7 +118,13 @@ void bqws_pt_free_server(bqws_pt_server *sv);
 
 bqws_socket *bqws_pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const bqws_server_opts *server_opts);
 
+// Query
+
+bqws_pt_address bqws_pt_get_address(const bqws_socket *ws);
+
 // -- Utility
+
+void bqws_pt_format_address(char *dst, size_t size, const bqws_pt_address *addr);
 
 void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err);
 

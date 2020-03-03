@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <assert.h>
 #include <stdio.h>
 
 // -- Generic
@@ -16,6 +15,17 @@
 __declspec(thread) static bqws_pt_error t_err;
 #else
 __thread static bqws_pt_error t_err;
+#endif
+
+#define BQWS_PT_DELETED_MAGIC  0xbdbdbdbd
+#define BQWS_PT_IO_MAGIC       0x77737074
+#define BQWS_PT_EM_MAGIC       0x7773656d
+#define BQWS_PT_SERVER_MAGIC   0x77737376
+
+
+#ifndef bqws_assert
+#include <assert.h>
+#define bqws_assert(x) assert(x)
 #endif
 
 static void pt_fail_pt(const char *func, bqws_pt_error_code code)
@@ -36,6 +46,7 @@ typedef struct pt_em_partial {
 } pt_em_partial;
 
 typedef struct {
+	uint32_t magic;
 	int handle;
 	pt_em_partial *partial_first;
 	pt_em_partial *partial_last;
@@ -267,7 +278,7 @@ static void pt_shutdown()
 
 static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t size)
 {
-	assert(0 && "Should never get here");
+	bwqs_assert(0 && "Should never get here");
 }
 
 static void pt_io_close(void *user, bqws_socket *ws)
@@ -282,6 +293,7 @@ static void pt_io_close(void *user, bqws_socket *ws)
 	}
 
 	pt_em_free_websocket(em->handle);
+	em->magic = BQWS_PT_DELETED_MAGIC;
 	free(em);
 }
 
@@ -310,6 +322,8 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 	opt.close_timeout = SIZE_MAX;
 
 	pt_em_socket *em = malloc(sizeof(pt_em_socket));
+	memset(em, 0, sizeof(pt_em_socket));
+	em->magic = BQWS_PT_EM_MAGIC;
 
 	opt.send_message_fn = &pt_send_message;
 	opt.send_message_user = em;
@@ -347,7 +361,41 @@ static void pt_free_server(bqws_pt_server *sv)
 {
 }
 
+static bqws_pt_address pt_get_address(const bqws_socket *ws)
+{
+	pt_em_socket *em = (pt_em_socket*)bqws_get_io_user(ws);
+	bqws_assert(em && em->magic == BQWS_PT_EM_MAGIC);
+	bqws_pt_address addr = { BQWS_PT_ADDRESS_WEBSOCKET };
+	memcpy(addr.addr, &em->handle, sizeof(int));
+	return addr;
+}
+
 #elif (defined(_WIN32) || defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)))
+
+// -- Shared for Windows and POSIX
+
+static const uint8_t ipv4_mapped_ipv6_prefix[] = {
+	0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,
+};
+
+static void addr_parse_ipv4(bqws_pt_address *dst, const void *addr, uint16_t port_native)
+{
+	dst->port = port_native;
+	dst->type = BQWS_PT_ADDRESS_IPV4;
+	memcpy(dst->address, addr, 4);
+}
+
+static void addr_parse_ipv6(bqws_pt_address *dst, const void *addr, uint16_t port_native)
+{
+	dst->port = port_native;
+	if (!memcmp(addr, ipv4_mapped_ipv6_prefix, sizeof(ipv4_mapped_ipv6_prefix))) {
+		dst->type = BQWS_PT_ADDRESS_IPV4;
+		memcpy(dst->address, (const char*)addr + 12, 4);
+	} else {
+		dst->type = BQWS_PT_ADDRESS_IPV6;
+		memcpy(dst->address, addr, 16);
+	}
+}
 
 #if defined(_WIN32)
 // -- OS: Windows
@@ -410,16 +458,29 @@ static os_socket os_imp_try_connect(ADDRINFOW *info, int family, ADDRINFOW **use
 		SOCKET s = socket(family, SOCK_STREAM, IPPROTO_TCP);
 		if (s == INVALID_SOCKET) { pt_fail_wsa("socket()"); return s; }
 		int res = connect(s, info->ai_addr, (int)info->ai_addrlen);
-		if (res == 0) return s;
+		if (res == 0) {
+			*used = info;
+			return s;
+		}
 		pt_fail_wsa("connect()");
 		closesocket(s);
-		*used = info;
 	}
 
 	return INVALID_SOCKET;
 }
 
-static os_socket os_socket_connect(const bqws_url *url)
+static void os_imp_parse_address(bqws_pt_address *dst, struct sockaddr *addr)
+{
+	if (addr->sa_family == AF_INET) {
+		struct sockaddr_in *sa = (struct sockaddr_in*)addr;
+		addr_parse_ipv4(dst, &sa->sin_addr, ntohs(sa->sin_port));
+	} else if (addr->sa_family == AF_INET6) {
+		struct sockaddr_in6 *sa = (struct sockaddr_in6*)addr;
+		addr_parse_ipv6(dst, &sa->sin6_addr, ntohs(sa->sin6_port));
+	}
+}
+
+static os_socket os_socket_connect(const bqws_url *url, bqws_pt_address *addr)
 {
 	wchar_t whost[256];
 	wchar_t service[32];
@@ -447,7 +508,10 @@ static os_socket os_socket_connect(const bqws_url *url)
 		s = os_imp_try_connect(info, AF_INET, &used_info);
 	}
 
-	// TODO: Retain address
+	if (s != INVALID_SOCKET) {
+		os_imp_parse_address(addr, used_info->ai_addr);
+	}
+
 	FreeAddrInfoW(info);
 
 	if (!os_imp_config_data_socket(s)) {
@@ -461,7 +525,6 @@ static os_socket os_socket_connect(const bqws_url *url)
 static os_socket os_socket_listen(const bqws_pt_listen_opts *pt_opts)
 {
 	os_socket s = OS_BAD_SOCKET;
-	bqws_pt_server *sv = NULL;
 	int res;
 
 	do {
@@ -497,12 +560,14 @@ static os_socket os_socket_listen(const bqws_pt_listen_opts *pt_opts)
 	return INVALID_SOCKET;
 }
 
-static os_socket os_socket_accept(os_socket listen_s)
+static os_socket os_socket_accept(os_socket listen_s, bqws_pt_address *addr)
 {
-	struct sockaddr_in6 addr;
-	int addr_len = sizeof(addr);
-	SOCKET s = accept(listen_s, (struct sockaddr*)&addr, &addr_len);
+	struct sockaddr_in6 addr_in;
+	int addr_len = sizeof(addr_in);
+	SOCKET s = accept(listen_s, (struct sockaddr*)&addr_in, &addr_len);
 	if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+	os_imp_parse_address(addr, (struct sockaddr*)&addr_in);
 
 	if (!os_imp_config_data_socket(s)) {
 		closesocket(s);
@@ -610,16 +675,29 @@ static os_socket os_imp_try_connect(struct addrinfo *info, int family, struct ad
 		int s = socket(family, SOCK_STREAM, IPPROTO_TCP);
 		if (s == -1) { pt_fail_posix("socket()"); return s; }
 		int res = connect(s, info->ai_addr, (int)info->ai_addrlen);
-		if (res == 0) return s;
+		if (res == 0) {
+			*used = info;
+			return s;
+		}
 		pt_fail_posix("connect()");
 		close(s);
-		*used = info;
 	}
 
 	return -1;
 }
 
-static os_socket os_socket_connect(const bqws_url *url)
+static void os_imp_parse_address(bqws_pt_address *dst, struct sockaddr *addr)
+{
+	if (addr->sa_family == AF_INET) {
+		struct sockaddr_in *sa = (struct sockaddr_in*)addr;
+		addr_parse_ipv4(dst, &sa->sin_addr, ntohs(sa->sin_port));
+	} else if (addr->sa_family == AF_INET6) {
+		struct sockaddr_in6 *sa = (struct sockaddr_in6*)addr;
+		addr_parse_ipv6(dst, &sa->sin6_addr, ntohs(sa->sin6_port));
+	}
+}
+
+static os_socket os_socket_connect(const bqws_url *url, bqws_pt_address *addr)
 {
 	char service[64];
 	snprintf(service, sizeof(service), "%d", (int)url->port);
@@ -644,7 +722,10 @@ static os_socket os_socket_connect(const bqws_url *url)
 		s = os_imp_try_connect(info, AF_INET, &used_info);
 	}
 
-	// TODO: Retain address
+	if (s != -1) {
+		os_imp_parse_address(addr, used_info->ai_addr);
+	}
+
 	freeaddrinfo(info);
 
 	if (!os_imp_config_data_socket(s)) {
@@ -658,7 +739,6 @@ static os_socket os_socket_connect(const bqws_url *url)
 static os_socket os_socket_listen(const bqws_pt_listen_opts *pt_opts)
 {
 	os_socket s = -1;
-	bqws_pt_server *sv = NULL;
 	int res;
 
 	do {
@@ -694,12 +774,14 @@ static os_socket os_socket_listen(const bqws_pt_listen_opts *pt_opts)
 	return -1;
 }
 
-static os_socket os_socket_accept(os_socket listen_s)
+static os_socket os_socket_accept(os_socket listen_s, bqws_pt_address *addr)
 {
-	struct sockaddr_in6 addr;
-	socklen_t addr_len = sizeof(addr);
-	int s = accept(listen_s, (struct sockaddr*)&addr, &addr_len);
+	struct sockaddr_in6 addr_in;
+	socklen_t addr_len = sizeof(addr_in);
+	int s = accept(listen_s, (struct sockaddr*)&addr_in, &addr_len);
 	if (s == -1) return -1;
+
+	os_imp_parse_address(addr, (struct sockaddr*)&addr_in);
 
 	if (!os_imp_config_data_socket(s)) {
 		close(s);
@@ -974,7 +1056,7 @@ static void tls_free_server(pt_tls_server *tls)
 
 static bool tls_init_accept(pt_tls *tls, pt_tls_server *tls_server, os_socket s)
 {
-	assert(0 && "Should never get here");
+	bwqs_assert(0 && "Should never get here");
 }
 
 static void tls_free(pt_tls *tls)
@@ -983,13 +1065,13 @@ static void tls_free(pt_tls *tls)
 
 static size_t tls_send(pt_tls *tls, const void *data, size_t size)
 {
-	assert(0 && "Should never get here");
+	bwqs_assert(0 && "Should never get here");
 	return SIZE_MAX;
 }
 
 static size_t tls_recv(pt_tls *tls, void *data, size_t size)
 {
-	assert(0 && "Should never get here");
+	bwqs_assert(0 && "Should never get here");
 	return SIZE_MAX;
 }
 
@@ -998,15 +1080,21 @@ static size_t tls_recv(pt_tls *tls, void *data, size_t size)
 // -- POSIX socket implementation
 
 typedef struct {
+	uint32_t magic;
+
 	os_socket s;
 	size_t send_size;
 	char send_buf[512];
 
 	bool secure;
 	pt_tls tls;
+
+	bqws_pt_address address;
 } pt_io;
 
 struct bqws_pt_server {
+	uint32_t magic;
+
 	os_socket s;
 	bool secure;
 	pt_tls_server tls;
@@ -1065,6 +1153,7 @@ static void io_free(pt_io *io)
 	if (io->secure) {
 		tls_free(&io->tls);
 	}
+	io->magic = BQWS_PT_DELETED_MAGIC;
 	free(io);
 }
 
@@ -1144,14 +1233,17 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 	pt_io *io = NULL;
 
 	do {
-		s = os_socket_connect(url);
+		bqws_pt_address addr = { 0 };
+		s = os_socket_connect(url, &addr);
 		if (s == OS_BAD_SOCKET) break;
 
 		io = malloc(sizeof(pt_io));
 		if (!io) break;
 
 		memset(io, 0, sizeof(pt_io));
+		io->magic = BQWS_PT_IO_MAGIC;
 		io->s = s;
+		io->address = addr;
 
 		if (url->secure) {
 			io->secure = true;
@@ -1188,6 +1280,7 @@ static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *pt_opts)
 	bqws_pt_server *sv = (bqws_pt_server*)malloc(sizeof(bqws_pt_server));
 	if (!sv) { pt_fail_pt("pt_listen()", BQWS_PT_ERR_OUT_OF_MEMORY); return NULL; }
 	memset(sv, 0, sizeof(bqws_pt_server));
+	sv->magic = BQWS_PT_SERVER_MAGIC;
 
 	if (pt_opts->secure) {
 		sv->secure = true;
@@ -1208,7 +1301,10 @@ static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *pt_opts)
 
 static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const bqws_server_opts *server_opts)
 {
-	os_socket s = os_socket_accept(sv->s);
+	bqws_assert(sv && sv->magic == BQWS_PT_SERVER_MAGIC);
+
+	bqws_pt_address addr = { 0 };
+	os_socket s = os_socket_accept(sv->s, &addr);
 	if (s == OS_BAD_SOCKET) return NULL;
 
 	pt_io *io = NULL;
@@ -1218,7 +1314,9 @@ static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const b
 		if (!io) break;
 
 		memset(io, 0, sizeof(pt_io));
+		io->magic = BQWS_PT_IO_MAGIC;
 		io->s = s;
+		io->address = addr;
 
 		if (sv->secure) {
 			io->secure = true;
@@ -1252,11 +1350,22 @@ static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const b
 
 static void pt_free_server(bqws_pt_server *sv)
 {
+	bqws_assert(sv && sv->magic == BQWS_PT_SERVER_MAGIC);
+
 	if (sv->secure) {
 		tls_free_server(&sv->tls);
 	}
 	os_socket_close(sv->s);
+	sv->magic = BQWS_PT_DELETED_MAGIC;
 	free(sv);
+}
+
+static bqws_pt_address pt_get_address(const bqws_socket *ws)
+{
+	pt_io *io = (pt_io*)bqws_get_io_user(ws);
+	bqws_assert(io && io->magic == BQWS_PT_IO_MAGIC);
+
+	return io->address;
 }
 
 #else
@@ -1365,6 +1474,7 @@ bqws_pt_server *bqws_pt_listen(const bqws_pt_listen_opts *pt_opts)
 
 void bqws_pt_free_server(bqws_pt_server *sv)
 {
+	if (!sv) return;
 	pt_free_server(sv);
 }
 
@@ -1373,6 +1483,85 @@ bqws_socket *bqws_pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const bqw
 	bqws_pt_clear_error();
 
 	return pt_accept(sv, opts, server_opts);
+}
+
+bqws_pt_address bqws_pt_get_address(const bqws_socket *ws)
+{
+	bqws_assert(ws);
+	return pt_get_address(ws);
+}
+
+void bqws_pt_format_address(char *dst, size_t size, const bqws_pt_address *addr)
+{
+	if (size == 0) return;
+
+	switch (addr->type) {
+
+	case BQWS_PT_ADDRESS_UNKNOWN:
+		snprintf(dst, size, "(unknown)");
+		break;
+
+	case BQWS_PT_ADDRESS_WEBSOCKET:
+		snprintf(dst, size, "websocket[%d]", *(int*)addr->address);
+		break;
+
+	case BQWS_PT_ADDRESS_IPV4:
+		snprintf(dst, size, "%u.%u.%u.%u:%u",
+			(unsigned)addr->address[0], (unsigned)addr->address[1],
+			(unsigned)addr->address[2], (unsigned)addr->address[3],
+			(unsigned)addr->port);
+		break;
+
+	case BQWS_PT_ADDRESS_IPV6:
+		{
+			const uint8_t *a = addr->address;
+
+			// Find the leftmost longest run of zeros that's longer than one
+			size_t longest_begin = SIZE_MAX;
+			size_t longest_zeros = 1;
+			{
+				size_t zeros = 0;
+				size_t zero_begin = 0;
+				for (size_t i = 0; i < 16; i += 2) {
+					if (a[i] == 0 && a[i + 1] == 0) {
+						if (zeros == 0) {
+							zero_begin = i;
+						}
+						zeros++;
+						if (zeros > longest_zeros) {
+							longest_begin = zero_begin;
+							longest_zeros = zeros;
+						}
+					} else {
+						zeros = 0;
+					}
+				}
+			}
+
+			bool need_colon = false;
+			char *ptr = dst, *end = dst + size;
+			ptr += snprintf(ptr, end - ptr, "[");
+			for (size_t i = 0; i < 16; i += 2) {
+				if (i == longest_begin) {
+					ptr += snprintf(ptr, end - ptr, "::");
+					need_colon = false;
+					i += (longest_zeros - 1) * 2;
+					continue;
+				}
+
+				unsigned v = (unsigned)a[i] << 8 | (unsigned)a[i + 1];
+				ptr += snprintf(ptr, end - ptr, need_colon ? ":%x" : "%x", v);
+
+				need_colon = true;
+			}
+			ptr += snprintf(ptr, end - ptr, "]:%u", (unsigned)addr->port);
+		}
+		break;
+
+	default:
+		snprintf(dst, size, "(bad type)");
+		break;
+	}
 }
 
 void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err)

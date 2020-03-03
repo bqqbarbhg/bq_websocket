@@ -336,6 +336,7 @@ void *bqws_user_data(const bqws_socket *ws);
 size_t bqws_user_data_size(const bqws_socket *ws);
 const char *bqws_get_name(const bqws_socket *ws);
 bqws_stats bqws_get_stats(const bqws_socket *ws);
+void *bqws_get_io_user(const bqws_socket *ws);
 
 // Get/update limits
 bqws_limits bqws_get_limits(const bqws_socket *ws);

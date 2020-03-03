@@ -2599,6 +2599,13 @@ bqws_stats bqws_get_stats(const bqws_socket *ws)
 	return stats;
 }
 
+void *bqws_get_io_user(const bqws_socket *ws)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+
+	return ws->user_io.user;
+}
+
 bqws_limits bqws_get_limits(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
