@@ -2,6 +2,7 @@
 #include "sokol_args.h"
 #include "sokol_gfx.h"
 #include "sokol_gl.h"
+#include "sokol_time.h"
 
 #include <assert.h>
 #include <stdlib.h>
@@ -31,9 +32,12 @@ static void log_debug(const char *fmt, ...)
 	OutputDebugStringA(buf);
 }
 
+#define log_error(...) log_debug(__VA_ARGS__)
+
 #else
 
-#define log_debug(...) fprintf(stderr, __VA_ARGS__)
+#define log_debug(...) printf(__VA_ARGS__)
+#define log_error(...) fprintf(stderr, __VA_ARGS__)
 
 #endif
 
@@ -44,7 +48,7 @@ static void log_bqws_pt_error()
 		char buf[2048];
 		bqws_pt_get_error_desc(buf, sizeof(buf), &err);
 
-		log_debug("Failed to host: %s %s error %d / 0x%08x: %s\n",
+		log_error("Failed to host: %s %s error %d / 0x%08x: %s\n",
 			err.function, bqws_pt_error_type_str(err.type), (int)err.data, (uint32_t)err.data, buf);
 	}
 }
@@ -63,6 +67,7 @@ typedef enum {
 	MSG_INIT,
 	MSG_UPDATE,
 	MSG_CLIENT_UPDATE,
+	MSG_PING,
 	MSG_LAST = 0x7fffffff,
 } msg_type;
 
@@ -89,6 +94,11 @@ typedef struct {
 	msg_base base;
 	vec2 pos;
 } msg_client_update;
+
+typedef struct {
+	msg_base base;
+	uint64_t time;
+} msg_ping;
 
 // -- Server
 
@@ -129,6 +139,10 @@ void server_msg(server *s, client *c, msg_base *base, size_t size)
 		msg_client_update *msg = (msg_client_update*)base;
 		assert(size == sizeof(msg_client_update));
 		c->pos = msg->pos;
+	} else if (base->type == MSG_PING) {
+		msg_ping *msg = (msg_ping*)base;
+		assert(size == sizeof(msg_ping));
+		bqws_send_binary(c->ws, msg, sizeof(msg_ping));
 	} else {
 		assert(0);
 	}
@@ -159,7 +173,11 @@ void server_update(server *s)
 			bqws_send_binary(ws, &msg, sizeof(msg));
 		}
 
-		log_debug("Client joined: %zu\n", i);
+		bqws_pt_address addr = bqws_pt_get_address(ws);
+		char addr_str[64];
+		bqws_pt_format_address(addr_str, sizeof(addr_str), &addr);
+
+		log_debug("Client joined: %zu (%s)\n", i, addr_str);
 		c->active = true;
 		c->ws = ws;
 	}
@@ -234,6 +252,7 @@ typedef struct {
 	bqws_socket *ws;
 	player players[MAX_CLIENTS];
 	int local_index;
+	float ping_timer;
 } game;
 
 game g_game;
@@ -288,8 +307,15 @@ void game_msg(game *g, msg_base *base, size_t size)
 			}
 		}
 
+	} else if (base->type == MSG_PING) {
+		msg_ping *msg = (msg_ping*)base;
+		assert(size == sizeof(msg_ping));
+
+		double ms = stm_ms(stm_since(msg->time));
+		log_debug("Ping: %.1fms\n", ms);
+
 	} else {
-		printf("Bad message type: %d\n", base->type);
+		log_debug("Bad message type: %d\n", base->type);
 		assert(0);
 	}
 }
@@ -393,6 +419,17 @@ void game_frame(float dt)
 
 	game_update(g, dt);
 	game_render(g);
+
+	// Check ping every second
+	g->ping_timer += dt;
+	if (g->ping_timer >= 1.0f) {
+		g->ping_timer = 0.0f;
+
+		msg_ping msg;
+		msg.base.type = MSG_PING;
+		msg.time = stm_now();
+		bqws_send_binary(g->ws, &msg, sizeof(msg));
+	}
 
 	// Send update to server
 	{

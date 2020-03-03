@@ -278,7 +278,7 @@ static void pt_shutdown()
 
 static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t size)
 {
-	bwqs_assert(0 && "Should never get here");
+	bqws_assert(0 && "Should never get here");
 }
 
 static void pt_io_close(void *user, bqws_socket *ws)
@@ -366,7 +366,7 @@ static bqws_pt_address pt_get_address(const bqws_socket *ws)
 	pt_em_socket *em = (pt_em_socket*)bqws_get_io_user(ws);
 	bqws_assert(em && em->magic == BQWS_PT_EM_MAGIC);
 	bqws_pt_address addr = { BQWS_PT_ADDRESS_WEBSOCKET };
-	memcpy(addr.addr, &em->handle, sizeof(int));
+	memcpy(addr.address, &em->handle, sizeof(int));
 	return addr;
 }
 
