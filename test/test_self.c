@@ -4,10 +4,10 @@
 bqws_socket *client;
 bqws_socket *server;
 
-static size_t push_send(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size)
+static size_t push_send(void *user, bqws_socket *ws, const void *data, size_t size)
 {
 	bqws_socket *dst = *(bqws_socket**)user;
-	return bqws_read_from(dst, data, max_size);
+	return bqws_read_from(dst, data, size);
 }
 
 static size_t pull_recv(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size)
