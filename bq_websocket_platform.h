@@ -6,6 +6,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define BQWS_PT_MAX_ADDRESS_SIZE 16
 #define BQWS_PT_MAX_ADDRESS_FORMAT_LENGTH 64
 
@@ -93,6 +97,9 @@ typedef struct bqws_pt_listen_opts {
 	// default: 128
 	size_t backlog;
 
+	// Attempt to share a port with other processes ie. `SO_REUSEPORT`
+	bool reuse_port;
+
 } bqws_pt_listen_opts;
 
 // -- Global initialization
@@ -130,5 +137,9 @@ void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err);
 
 const char *bqws_pt_error_type_str(bqws_pt_error_type type);
 const char *bqws_pt_error_code_str(bqws_pt_error_code err);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

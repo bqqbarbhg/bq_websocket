@@ -5,6 +5,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef _MSC_VER
+	#pragma warning(push)
+	#pragma warning(disable: 4200) // warning C4200: nonstandard extension used: zero-sized array in struct/union
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct bqws_socket bqws_socket;
 
 typedef enum bqws_error {
@@ -112,7 +121,7 @@ typedef struct bqws_msg {
 	// Size of `data` in bytes
 	size_t capacity;
 
-	char data[];
+	char data[0];
 } bqws_msg;
 
 // Message header
@@ -337,6 +346,7 @@ size_t bqws_user_data_size(const bqws_socket *ws);
 const char *bqws_get_name(const bqws_socket *ws);
 bqws_stats bqws_get_stats(const bqws_socket *ws);
 void *bqws_get_io_user(const bqws_socket *ws);
+bool bqws_get_io_closed(const bqws_socket *ws);
 
 // Get/update limits
 bqws_limits bqws_get_limits(const bqws_socket *ws);
@@ -391,6 +401,7 @@ size_t bqws_write_to(bqws_socket *ws, void *data, size_t size);
 // Direct control
 void bqws_direct_push_msg(bqws_socket *ws, bqws_msg *msg);
 void bqws_direct_set_override_state(bqws_socket *ws, bqws_state state);
+void bqws_direct_fail(bqws_socket *ws, bqws_error err);
 
 // -- Utility
 
@@ -399,5 +410,13 @@ bool bqws_parse_url(bqws_url *url, const char *str);
 const char *bqws_error_str(bqws_error error);
 const char *bqws_msg_type_str(bqws_msg_type type);
 const char *bqws_state_str(bqws_state state);
+
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef _MSC_VER
+	#pragma warning(push)
+#endif
 
 #endif

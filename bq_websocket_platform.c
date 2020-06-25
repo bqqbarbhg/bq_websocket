@@ -14,14 +14,13 @@
 #if defined(_WIN32)
 __declspec(thread) static bqws_pt_error t_err;
 #else
-__thread static bqws_pt_error t_err;
+static __thread bqws_pt_error t_err;
 #endif
 
 #define BQWS_PT_DELETED_MAGIC  0xbdbdbdbd
 #define BQWS_PT_IO_MAGIC       0x77737074
 #define BQWS_PT_EM_MAGIC       0x7773656d
 #define BQWS_PT_SERVER_MAGIC   0x77737376
-
 
 #ifndef bqws_assert
 #include <assert.h>
@@ -150,7 +149,11 @@ EM_JS(int, pt_em_websocket_send_binary, (int handle, const char *data, size_t si
 		return 1;
 	}
 
-	ws.send(HEAPU8.subarray(data, data + size));
+	#if defined(__EMSCRIPTEN_PTHREADS__)
+		ws.send(new Uint8Array(HEAPU8.subarray(data, data + size)));
+	#else
+		ws.send(HEAPU8.subarray(data, data + size));
+	#endif
 	return 1;
 });
 
@@ -279,6 +282,7 @@ static void pt_shutdown()
 static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t size)
 {
 	bqws_assert(0 && "Should never get here");
+	return SIZE_MAX;
 }
 
 static void pt_io_close(void *user, bqws_socket *ws)
@@ -369,6 +373,7 @@ static bqws_pt_address pt_get_address(const bqws_socket *ws)
 	memcpy(addr.address, &em->handle, sizeof(int));
 	return addr;
 }
+
 
 #elif (defined(_WIN32) || defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)))
 
@@ -661,7 +666,7 @@ static bool os_imp_config_data_socket(os_socket s)
 
 	// Disable Nagle's algorithm to make writes immediate
 	int nd_flag = 1;
-	res = setsockopt(s, SOL_TCP, TCP_NODELAY, &nd_flag, sizeof(nd_flag));
+	res = setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &nd_flag, sizeof(nd_flag));
 	if (res != 0) { pt_fail_posix("setsockopt(TCP_NODELAY)"); return false; }
 
 	return true;
@@ -750,6 +755,11 @@ static os_socket os_socket_listen(const bqws_pt_listen_opts *pt_opts)
 		res = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6_flag, sizeof(ipv6_flag));
 		if (res != 0) { pt_fail_posix("setsockopt(IPPROTO_IPV6)"); break; }
 
+		if (pt_opts->reuse_port) {
+			int reuse_flag = 1;
+			setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &reuse_flag, sizeof(reuse_flag));
+		}
+
 		// Set the socket to be non-blocking
 		int nb_flag = 1;
 		res = ioctl(s, FIONBIO, &nb_flag);
@@ -833,6 +843,7 @@ static void os_socket_close(os_socket s)
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#define BQWS_PT_HAS_OPENSSL
 
 typedef struct {
 	bool connected;
@@ -1056,7 +1067,8 @@ static void tls_free_server(pt_tls_server *tls)
 
 static bool tls_init_accept(pt_tls *tls, pt_tls_server *tls_server, os_socket s)
 {
-	bwqs_assert(0 && "Should never get here");
+	bqws_assert(0 && "Should never get here");
+	return false;
 }
 
 static void tls_free(pt_tls *tls)
@@ -1065,15 +1077,167 @@ static void tls_free(pt_tls *tls)
 
 static size_t tls_send(pt_tls *tls, const void *data, size_t size)
 {
-	bwqs_assert(0 && "Should never get here");
+	bqws_assert(0 && "Should never get here");
 	return SIZE_MAX;
 }
 
 static size_t tls_recv(pt_tls *tls, void *data, size_t size)
 {
-	bwqs_assert(0 && "Should never get here");
+	bqws_assert(0 && "Should never get here");
 	return SIZE_MAX;
 }
+
+#endif
+
+#if defined(__APPLE__)
+
+// -- CF socket implementation
+
+#include <CoreFoundation/CFDictionary.h>
+#include <CoreFoundation/CFStream.h>
+#include <CFNetwork/CFNetwork.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <netinet/tcp.h>
+#include <netinet/in.h>
+
+typedef struct {
+    bool enabled;
+    bool has_address;
+    bool set_nonblocking;
+    CFWriteStreamRef write;
+    CFReadStreamRef read;
+} pt_cf;
+
+static void cf_free(pt_cf *cf)
+{
+    if (cf->read) CFRelease(cf->read);
+    if (cf->write) CFRelease(cf->write);
+    free(cf);
+}
+
+static size_t cf_send(pt_cf *cf, const void *data, size_t size)
+{
+    if (size == 0) return 0;
+    
+    switch (CFWriteStreamGetStatus(cf->write)) {
+        case kCFStreamStatusOpening: return 0;
+        case kCFStreamStatusError: case kCFStreamStatusClosed: return SIZE_MAX;
+        default: if (!CFWriteStreamCanAcceptBytes(cf->write)) return 0;
+    }
+    
+    if (!cf->set_nonblocking) {
+        cf->set_nonblocking = true;
+        CFDataRef socket_data = CFWriteStreamCopyProperty(cf->write, kCFStreamPropertySocketNativeHandle);
+        if (socket_data) {
+            CFSocketNativeHandle s = -1;
+            CFDataGetBytes(socket_data, CFRangeMake(0, sizeof(CFSocketNativeHandle)), (UInt8*)&s);
+            if (s >= 0) {
+                int nd_flag = 1;
+                setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &nd_flag, sizeof(nd_flag));
+            }
+            CFRelease(socket_data);
+        }
+    }
+    
+    CFIndex res = CFWriteStreamWrite(cf->write, data, size);
+    if (res < 0) return SIZE_MAX;
+    return (size_t)res;
+}
+
+static size_t cf_recv(pt_cf *cf, void *data, size_t max_size)
+{
+    if (max_size == 0) return 0;
+
+    switch (CFReadStreamGetStatus(cf->read)) {
+        case kCFStreamStatusOpening: return 0;
+        case kCFStreamStatusError: case kCFStreamStatusClosed: return SIZE_MAX;
+        default: if (!CFReadStreamHasBytesAvailable(cf->read)) return 0;
+    }
+    
+    CFIndex res = CFReadStreamRead(cf->read, (UInt8*)data, (CFIndex)max_size);
+    if (res < 0) return SIZE_MAX;
+    return (size_t)res;
+}
+
+static bool cf_connect(const bqws_url *url, pt_cf *cf)
+{
+    CFAllocatorRef ator = kCFAllocatorDefault;
+    
+    do {
+        memset(cf, 0, sizeof(pt_cf));
+
+        CFStringRef host_ref = CFStringCreateWithCString(ator, url->host, kCFStringEncodingUTF8);
+        CFStreamCreatePairWithSocketToHost(ator, host_ref, url->port, &cf->read, &cf->write);
+        CFRelease(host_ref);
+        
+        if (!cf->read || !cf->write) {
+            pt_fail_pt("CFStreamCreatePairWithSocketToHost()", BQWS_PT_ERR_OUT_OF_MEMORY);
+            break;
+        }
+        
+        if (url->secure) {
+            CFStringRef keys[] = { kCFStreamPropertySocketSecurityLevel };
+            CFStringRef values[] = { kCFStreamSocketSecurityLevelTLSv1 };
+            CFDictionaryRef dict = CFDictionaryCreate(ator, (const void**)keys, (const void**)values, 1,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            
+            CFWriteStreamSetProperty(cf->write, kCFStreamPropertySSLSettings, dict);
+            CFReadStreamSetProperty(cf->read, kCFStreamPropertySSLSettings, dict);
+            
+            CFRelease(dict);
+        }
+        
+        CFWriteStreamOpen(cf->write);
+        CFReadStreamOpen(cf->read);
+
+        cf->enabled = true;
+        return true;
+    } while (false);
+    
+    if (cf) cf_free(cf);
+    return false;
+}
+
+static void cf_get_address(pt_cf *cf, bqws_pt_address *address)
+{
+    if (!cf->has_address) {
+        cf->has_address = true;
+        
+        CFDataRef socket_data = CFWriteStreamCopyProperty(cf->write, kCFStreamPropertySocketNativeHandle);
+        if (socket_data) {
+            CFSocketNativeHandle s = -1;
+            CFDataGetBytes(socket_data, CFRangeMake(0, sizeof(CFSocketNativeHandle)), (UInt8*)&s);
+            if (s >= 0) {
+                struct sockaddr_in6 addr;
+                socklen_t addr_len = sizeof(addr);
+                if (getsockname(s, (struct sockaddr*)&addr, &addr_len) == 0
+                    && addr_len >= sizeof(struct sockaddr_in)) {
+                    os_imp_parse_address(address, (struct sockaddr*)&addr);
+                }
+            }
+            CFRelease(socket_data);
+        }
+    }
+}
+
+#define cf_enabled(cf) ((cf)->enabled)
+
+#else
+
+typedef struct {
+    int unused;
+} pt_cf;
+
+static void cf_free(pt_cf *cf) { }
+static size_t cf_send(pt_cf *cf, const void *data, size_t size) { return SIZE_MAX; }
+static size_t cf_recv(pt_cf *cf, void *data, size_t max_size) { return SIZE_MAX; }
+static bool cf_connect(const bqws_url *url, pt_cf *cf) { return false; }
+static void cf_get_address(pt_cf *cf, bqws_pt_address *address) { }
+
+#define cf_enabled(cf) (false)
 
 #endif
 
@@ -1088,6 +1252,8 @@ typedef struct {
 
 	bool secure;
 	pt_tls tls;
+
+    pt_cf cf;
 
 	bqws_pt_address address;
 } pt_io;
@@ -1104,7 +1270,9 @@ static size_t io_imp_send(pt_io *io, const void *data, size_t size)
 {
 	if (size == 0) return 0;
 
-	if (io->secure) {
+    if (cf_enabled(&io->cf)) {
+        return cf_send(&io->cf, data, size);
+    } else if (io->secure) {
 		return tls_send(&io->tls, data, size);
 	} else {
 		return os_socket_send(io->s, data, size);
@@ -1137,22 +1305,11 @@ static size_t io_push_imp(pt_io *io, const char *ptr, const char *end)
 	return to_copy;
 }
 
-static size_t io_recv(pt_io *io, const void *data, size_t size)
-{
-	if (size == 0) return 0;
-
-	if (io->secure) {
-		return tls_send(&io->tls, data, size);
-	} else {
-		return os_socket_send(io->s, data, size);
-	}
-}
-
 static void io_free(pt_io *io)
 {
-	if (io->secure) {
-		tls_free(&io->tls);
-	}
+    if (cf_enabled(&io->cf)) cf_free(&io->cf);
+	if (io->secure) tls_free(&io->tls);
+    if (io->s != OS_BAD_SOCKET) os_socket_close(io->s);
 	io->magic = BQWS_PT_DELETED_MAGIC;
 	free(io);
 }
@@ -1192,7 +1349,9 @@ static size_t pt_io_recv(void *user, bqws_socket *ws, void *data, size_t max_siz
 	if (max_size == 0) return 0;
 
 	pt_io *io = (pt_io*)user;
-	if (io->secure) {
+    if (cf_enabled(&io->cf)) {
+        return cf_recv(&io->cf, data, max_size);
+    } else if (io->secure) {
 		return tls_recv(&io->tls, data, max_size);
 	} else {
 		return os_socket_recv(io->s, data, max_size);
@@ -1229,26 +1388,28 @@ static void pt_shutdown()
 
 static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
 {
-	os_socket s = OS_BAD_SOCKET;
 	pt_io *io = NULL;
 
 	do {
-		bqws_pt_address addr = { 0 };
-		s = os_socket_connect(url, &addr);
-		if (s == OS_BAD_SOCKET) break;
+        io = malloc(sizeof(pt_io));
+        if (!io) break;
+        
+        memset(io, 0, sizeof(pt_io));
+        io->s = OS_BAD_SOCKET;
 
-		io = malloc(sizeof(pt_io));
-		if (!io) break;
+        if (!cf_connect(url, &io->cf)) {
+    		bqws_pt_address addr = { 0 };
+    		io->s = os_socket_connect(url, &addr);
+    		if (io->s == OS_BAD_SOCKET) break;
 
-		memset(io, 0, sizeof(pt_io));
-		io->magic = BQWS_PT_IO_MAGIC;
-		io->s = s;
-		io->address = addr;
+    		io->magic = BQWS_PT_IO_MAGIC;
+    		io->address = addr;
 
-		if (url->secure) {
-			io->secure = true;
-			if (!tls_init_client(&io->tls, io->s, pt_opts, opts, client_opts)) break;
-		}
+    		if (url->secure) {
+    			io->secure = true;
+    			if (!tls_init_client(&io->tls, io->s, pt_opts, opts, client_opts)) break;
+    		}
+        }
 
 		bqws_opts opt;
 		if (opts) {
@@ -1271,7 +1432,6 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 	} while (false);
 
 	if (io) io_free(io);
-	if (s != OS_BAD_SOCKET) os_socket_close(s);
 	return NULL;
 }
 
@@ -1317,6 +1477,7 @@ static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const b
 		io->magic = BQWS_PT_IO_MAGIC;
 		io->s = s;
 		io->address = addr;
+        s = OS_BAD_SOCKET;
 
 		if (sv->secure) {
 			io->secure = true;
@@ -1343,7 +1504,7 @@ static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const b
 
 	} while (false);
 
-	if (io) free(io);
+	if (io) io_free(io);
 	os_socket_close(s);
 	return NULL;
 }
@@ -1364,7 +1525,9 @@ static bqws_pt_address pt_get_address(const bqws_socket *ws)
 {
 	pt_io *io = (pt_io*)bqws_get_io_user(ws);
 	bqws_assert(io && io->magic == BQWS_PT_IO_MAGIC);
-
+    
+    if (cf_enabled(&io->cf)) cf_get_address(&io->cf, &io->address);
+    
 	return io->address;
 }
 
@@ -1488,6 +1651,10 @@ bqws_socket *bqws_pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const bqw
 bqws_pt_address bqws_pt_get_address(const bqws_socket *ws)
 {
 	bqws_assert(ws);
+	if (bqws_get_io_closed(ws)) {
+		bqws_pt_address null_addr = { 0 };
+		return null_addr;
+	}
 	return pt_get_address(ws);
 }
 
@@ -1627,7 +1794,7 @@ void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err)
 		break;
 
 	case BQWS_PT_ERRTYPE_OPENSSL:
-		#if BQWS_PT_USE_OPENSSL
+		#if defined(BQWS_PT_HAS_OPENSSL) && !defined(__EMSCRIPTEN__)
 			ERR_error_string_n((unsigned long)err->data, dst, size);
 		#endif
 		break;

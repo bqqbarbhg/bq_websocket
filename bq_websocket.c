@@ -15,29 +15,15 @@
 		#include <intrin.h>
 		#include <xmmintrin.h>
 		#define BQWS_USE_SSE 1
-		#define bqws_cpu_time() (uint64_t)__rdtsc()
 	#endif
 
-
 #elif defined(__GNUC__) || defined(__clang__)
-	#define bqws_forceinline __attribute__((always_inline))
+	#define bqws_forceinline __attribute__((always_inline)) inline
 
-	#if defined(__EMSCRIPTEN__)
-		#include <emscripten/em_js.h>
-
-		EM_JS(double, bqws_js_perfnow, (void), {
-			return performance.now();
-		});
-
-		#define bqws_cpu_time() (uint64_t)(bqws_js_perfnow() * 1e3)
-
-	#elif defined(__i386__) || defined(__x86_64__)
-
+	#if defined(__i386__) || defined(__x86_64__)
 		#include <x86intrin.h>
 		#include <xmmintrin.h>
 		#define BQWS_USE_SSE 1
-		#define bqws_cpu_time() (uint64_t)__rdtsc()
-
 	#endif
 
 #else
@@ -49,7 +35,6 @@
 #define bqws_assert(x) assert(x)
 #endif
 
-
 // TODO: QueryPerformanceCounter() or clock_gettime() might be faster
 typedef clock_t bqws_timestamp;
 
@@ -60,7 +45,7 @@ static bqws_timestamp bqws_get_timestamp()
 
 static size_t bqws_timestamp_delta_to_ms(bqws_timestamp begin, bqws_timestamp end)
 {
-	return (end - begin) * 1000 / CLOCKS_PER_SEC;
+	return (size_t)((double)(end - begin) * 1000.0 / (double)CLOCKS_PER_SEC);
 }
 
 typedef struct {
@@ -170,13 +155,12 @@ typedef struct {
 
 // Random entropy source
 typedef struct {
-	uint64_t cpu_time_a;
 	void (*function_pointer)(bqws_socket *ws, const bqws_client_opts *opts);
 	void *stack_pointer;
 	void *heap_pointer;
 	clock_t clock;
 	time_t time;
-	uint64_t cpu_time_b;
+	uint32_t mask_key;
 } bqws_random_entropy;
 
 typedef struct {
@@ -285,6 +269,11 @@ struct bqws_socket {
 		bqws_client_opts *opts_from_client;
 		char *client_key_base64;
 		bool client_handshake_done;
+		bool client_has_protocol;
+
+		// Masking random state
+		uint64_t mask_random_state;
+		uint64_t mask_random_stream;
 
 		// Write/read buffers `recv_header` is also used to buffer
 		// multiple small messages
@@ -781,16 +770,14 @@ static void msg_queue_get_stats(bqws_msg_queue *mq, bqws_io_stats *stats)
 
 static uint32_t mask_make_key(bqws_socket *ws)
 {
-	// https://nullprogram.com/blog/2018/07/31/
-	uint64_t x = bqws_cpu_time();
-
-	x ^= x >> 32;
-	x *= UINT64_C(0xd6e8feb86659fd93);
-	x ^= x >> 32;
-	x *= UINT64_C(0xd6e8feb86659fd93);
-	x ^= x >> 32;
-
-	return (uint32_t)x;
+	bqws_assert_locked(&ws->io.mutex);
+	// PCG Random step
+	const uint64_t c = UINT64_C(6364136223846793005);
+	uint64_t s = ws->io.mask_random_state * c + ws->io.mask_random_stream;
+	uint32_t xs = (uint32_t)(((s >> 18u) ^ s) >> 27u), r = s >> 59u;
+	ws->io.mask_random_state = s;
+	uint32_t rng = (xs >> r) | (xs << (((uint32_t)-(int32_t)r) & 31));
+	return rng ^ (uint32_t)bqws_get_timestamp();
 }
 
 static void mask_apply(void *data, size_t size, uint32_t mask)
@@ -964,13 +951,12 @@ static void hs_client_handshake(bqws_socket *ws, const bqws_client_opts *opts)
 
 	// Random key
 	bqws_random_entropy entropy;
-	entropy.cpu_time_a = bqws_cpu_time();
 	entropy.clock = clock();
 	entropy.time = time(NULL);
 	entropy.function_pointer = &hs_client_handshake;
 	entropy.stack_pointer = &entropy;
 	entropy.heap_pointer = ws;
-	entropy.cpu_time_b = bqws_cpu_time();
+	entropy.mask_key = mask_make_key(ws);
 
 	uint8_t digest[20];
 	bqws_sha1(digest, &entropy, sizeof(entropy));
@@ -1009,7 +995,7 @@ static void hs_server_handshake(bqws_socket *ws)
 	bqws_mutex_unlock(&ws->state.mutex);
 
 	bqws_assert(protocol);
-	if (*protocol) {
+	if (*protocol && ws->io.client_has_protocol) {
 		hs_push3(ws, "Sec-WebSocket-Protocol: ", protocol, "\r\n");
 	}
 
@@ -1127,6 +1113,7 @@ static bool hs_parse_client_handshake(bqws_socket *ws)
 			opts->num_headers++;
 		} else if (streq_ic(header->name, "Sec-Websocket-Protocol")) {
 			size_t cur_pos = pos;
+			ws->io.client_has_protocol = true;
 
 			// Parse protocols
 			pos = value_pos;
@@ -2292,6 +2279,9 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 		ws->state.state = BQWS_STATE_CONNECTING;
 	}
 
+	ws->io.mask_random_state = (uint32_t)(uintptr_t)ws ^ (uint32_t)time(NULL);
+	ws->io.mask_random_stream = (uint32_t)bqws_get_timestamp() | 1u;
+
 	if (ws->err) {
 		bqws_free_socket(ws);
 		return NULL;
@@ -2442,11 +2432,11 @@ void bqws_free_socket(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 
+	ws_log(ws, "Freed");
+
 	if (ws->user_io.close_fn && !ws->state.io_closed) {
 		ws->user_io.close_fn(ws->user_io.user, ws);
 	}
-
-	ws_log(ws, "Freed");
 
 	// Free everything, as the socket may have errored it can
 	// be in almost any state
@@ -2606,6 +2596,13 @@ void *bqws_get_io_user(const bqws_socket *ws)
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 
 	return ws->user_io.user;
+}
+
+bool bqws_get_io_closed(const bqws_socket *ws)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+
+	return ws->state.io_closed;
 }
 
 bqws_limits bqws_get_limits(const bqws_socket *ws)
@@ -3079,6 +3076,11 @@ void bqws_direct_set_override_state(bqws_socket *ws, bqws_state state)
 	bqws_mutex_unlock(&ws->state.mutex);
 }
 
+void bqws_direct_fail(bqws_socket *ws, bqws_error err)
+{
+	ws_fail(ws, err);
+}
+
 bool bqws_parse_url(bqws_url *url, const char *str)
 {
 	// Format [wss://][host.example.com][:1234][/path]
@@ -3097,7 +3099,7 @@ bool bqws_parse_url(bqws_url *url, const char *str)
 	if (port && port > path) port = NULL;
 	const char *host_end = port ? port : path;
 
-	size_t scheme_len = scheme_end - scheme;
+	size_t scheme_len = scheme_end ? scheme_end - scheme : 0;
 	size_t host_len = host_end - host;
 	if (scheme_len >= sizeof(url->scheme)) return false;
 	if (host_len >= sizeof(url->host)) return false;
