@@ -24,6 +24,7 @@ for (;;) {
         bqws_free_msg(msg);
         break;
     }
+    sleep(1);
 }
 
 bqws_free_socket(ws);
