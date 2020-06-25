@@ -14,7 +14,7 @@ CFStream on Apple platforms, and browser WebSocket implementation on Emscripten.
 bqws_socket *ws = bqws_pt_connect("ws://demos.kaazing.com/echo", NULL, NULL, NULL);
 bqws_send_text(ws, "Hello world!");
 
-// bq_websocket_platform uses non-blockin IO so we need to poll here
+// bq_websocket_platform.h uses non-blocking IO so we need to poll here
 for (;;) {
     bqws_update(ws);
     bqws_msg *msg = bqws_recv(ws);
