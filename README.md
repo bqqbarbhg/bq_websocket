@@ -7,8 +7,8 @@ The repository also contains a reference platform implementation (bq_websocket_p
 CFStream on Apple platforms, and browser WebSocket implementation on Emscripten. SSL is supported via OpenSSL if `BQWS_PT_USE_OPENSSL` is defined to a non-zero value.
 
 The library is thread-safe and you can run IO code and send/receive messages in other threads in parallel.
-Emscripten doesn't do proxying between WebWorkers so if you are running with a multi-threaded Emscripten
-you need to make sure to call `bqws_update()` _only_ from a single thread for a socket instance!
+Emscripten doesn't do proxying between WebWorkers so if you are running in a multi-threaded environment
+make sure to call `bqws_update()` _only_ from a single thread for a socket instance!
 
 ## Integration
 
