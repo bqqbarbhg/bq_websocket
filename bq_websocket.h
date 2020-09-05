@@ -326,6 +326,10 @@ typedef struct bqws_client_opts {
 	bqws_header headers[BQWS_MAX_HEADERS];
 	size_t num_headers;
 
+	// Random key (optional)
+	bool use_random_key;
+	uint8_t random_key[16];
+
 } bqws_client_opts;
 
 // Call `bqws_server_accept()` or `bqws_server_reject()` here to handle the socket

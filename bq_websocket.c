@@ -1121,9 +1121,14 @@ static void hs_client_handshake(bqws_socket *ws, const bqws_client_opts *opts)
 
 	uint8_t digest[20];
 	bqws_sha1(digest, &entropy, sizeof(entropy));
+	const uint8_t *key = digest;
+
+	if (opts->use_random_key) {
+		key = (const uint8_t*)opts->random_key;
+	}
 
 	// We need to retain the key until we have parsed the server handshake
-	bool ret = hs_to_base64(ws->io.client_key_base64, sizeof(ws->io.client_key_base64), digest, 16);
+	bool ret = hs_to_base64(ws->io.client_key_base64, sizeof(ws->io.client_key_base64), key, 16);
 	bqws_assert(ret == true); // 32 bytes should always be enough
 	hs_push3(ws, "Sec-WebSocket-Key: ", ws->io.client_key_base64, "\r\n");
 
@@ -2603,13 +2608,6 @@ void bqws_free_socket(bqws_socket *ws)
 	// Free everything, as the socket may have errored it can
 	// be in almost any state
 
-	// Mutexes
-	bqws_mutex_free(&ws->err_mutex);
-	bqws_mutex_free(&ws->state.mutex);
-	bqws_mutex_free(&ws->io.mutex);
-	bqws_mutex_free(&ws->alloc.mutex);
-	bqws_mutex_free(&ws->partial.mutex);
-
 	// Pending messages
 	msg_free_queue(ws, &ws->recv_queue);
 	msg_free_queue(ws, &ws->recv_partial_queue);
@@ -2638,6 +2636,13 @@ void bqws_free_socket(bqws_socket *ws)
 		filter->magic = BQWS_DELETED_MAGIC;
 		ws_free(ws, filter, sizeof(bqws_verify_filter) + filter->text_size);
 	}
+
+	// Mutexes
+	bqws_mutex_free(&ws->err_mutex);
+	bqws_mutex_free(&ws->state.mutex);
+	bqws_mutex_free(&ws->io.mutex);
+	bqws_mutex_free(&ws->alloc.mutex);
+	bqws_mutex_free(&ws->partial.mutex);
 
 	bqws_assert(ws->alloc.memory_used == 0);
 
