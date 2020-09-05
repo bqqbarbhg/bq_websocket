@@ -36,6 +36,9 @@ Alternatively you can include the implementation files as headers to supply defi
 // Disable the default mutex
 // #define BQWS_SINGLE_THREAD 1
 
+// Use OpenSSL for platform TLS
+#define BQWS_PT_USE_OPENSSL 1
+
 // Renamed with .h suffix so the files don't build by default
 #include "bq_websocket.c.h"
 #include "bq_websocket_platform.c.h"
