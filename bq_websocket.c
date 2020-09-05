@@ -60,7 +60,119 @@ static size_t bqws_timestamp_delta_to_ms(bqws_timestamp begin, bqws_timestamp en
 	return (size_t)((double)(end - begin) * 1000.0 / (double)CLOCKS_PER_SEC);
 }
 
+#ifndef BQWS_DEBUG
+#if defined(NDEBUG)
+	#define BQWS_DEBUG 0
+#else
+	#define BQWS_DEBUG 1
+#endif
+#endif
+
 #ifndef bqws_mutex
+
+#if defined(_WIN32)
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <Windows.h>
+
+typedef struct {
+	CRITICAL_SECTION cs;
+#if BQWS_DEBUG
+	DWORD thread;
+#endif
+} bqws_mutex;
+
+static void bqws_mutex_init(bqws_mutex *m)
+{
+	InitializeCriticalSection(&m->cs);
+#if BQWS_DEBUG
+	m->thread = 0;
+#endif
+}
+
+static void bqws_mutex_free(bqws_mutex *m)
+{
+#if BQWS_DEBUG
+	m->thread = 0;
+#endif
+	DeleteCriticalSection(&m->cs);
+}
+
+static void bqws_mutex_lock(bqws_mutex *m)
+{
+	EnterCriticalSection(&m->cs);
+#if BQWS_DEBUG
+	m->thread = GetCurrentThreadId();
+#endif
+}
+
+static void bqws_mutex_unlock(bqws_mutex *m)
+{
+#if BQWS_DEBUG
+	m->thread = 0;
+#endif
+	LeaveCriticalSection(&m->cs);
+}
+
+#if BQWS_DEBUG
+	#define bqws_assert_locked(m) bqws_assert((m)->thread == GetCurrentThreadId());
+#else
+	#define bqws_assert_locked(m) (void)0
+#endif
+
+#elif (defined(__APPLE__) || defined(__linux__) || defined(__unix__)) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+
+#include <pthread.h>
+
+typedef struct {
+	pthread_mutex_t mutex;
+#if BQWS_DEBUG
+	bool locked;
+	pthread_t thread;
+#endif
+} bqws_mutex;
+
+static void bqws_mutex_init(bqws_mutex *m)
+{
+	pthread_mutex_init(&m->mutex, NULL);
+#if BQWS_DEBUG
+	m->locked = false;
+#endif
+}
+
+static void bqws_mutex_free(bqws_mutex *m)
+{
+#if BQWS_DEBUG
+	m->locked = false;
+#endif
+	pthread_mutex_destroy(&m->mutex);
+}
+
+static void bqws_mutex_lock(bqws_mutex *m)
+{
+	pthread_mutex_lock(&m->mutex);
+#if BQWS_DEBUG
+	m->locked = true;
+	m->thread = pthread_self();
+#endif
+}
+
+static void bqws_mutex_unlock(bqws_mutex *m)
+{
+#if BQWS_DEBUG
+	m->locked = false;
+#endif
+	pthread_mutex_unlock(&m->mutex);
+}
+
+#if BQWS_DEBUG
+	#define bqws_assert_locked(m) ((m)->locked && (m)->thread == pthread_self())
+#else
+	#define bqws_assert_locked(m) (void)0
+#endif
+
+#else
 
 typedef struct {
 	bool is_locked;
@@ -90,6 +202,14 @@ static void bqws_mutex_unlock(bqws_mutex *m)
 #define bqws_assert_locked(m) bqws_assert((m)->is_locked)
 
 #endif
+
+#else // not defined bqws_mutex
+
+#ifndef bqws_assert_locked
+#define bqws_assert_locked(m) (void)0
+#endif
+
+#endif // not defined bqws_mutex
 
 // -- Magic constants
 
