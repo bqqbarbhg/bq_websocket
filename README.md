@@ -6,6 +6,41 @@ The library itself (bq_websocket.h/c) does not do any IO, but supports both call
 The repository also contains a reference platform implementation (bq_websocket_platform.h/c) supporting non-blocking BSD sockets on Windows/Posix,
 CFStream on Apple platforms, and browser WebSocket implementation on Emscripten. SSL is supported via OpenSSL if `BQWS_PT_USE_OPENSSL` is defined to a non-zero value.
 
+The library is thread-safe and you can run IO code and send/receive messages in other threads in parallel.
+Emscripten doesn't do proxying between WebWorkers so if you are running with a multi-threaded Emscripten
+you need to make sure to call `bqws_update()` _only_ from a single thread for a socket instance!
+
+## Integration
+
+All you need to do is to add bq_websocket.c/h (and optionally bq_websocket_platform.c/h) to your build.
+Alternatively you can include the implementation files as headers to supply defines to customize their behavior:
+
+```cpp
+// Override the default/platform allocators, you don't need to do this at compile-time
+// if you supply custom allocators using the bqws_opts struct!
+#define bqws_malloc(size) my_alloc(size)
+#define bqws_realloc(ptr, size) my_realloc(ptr, size)
+#define bqws_free(ptr) my_free(ptr)
+
+// Custom assert and force-enable debug
+#define bqws_assert(cond) my_assert(cond)
+#define BQWS_DEBUG 1
+
+// Custom mutex implementation
+#define bqws_mutex my_mutex_t
+#define bqws_mutex_init(m) my_mutex_init(m)
+#define bqws_mutex_free(m) my_mutex_free(m)
+#define bqws_mutex_lock(m) my_mutex_lock(m)
+#define bqws_mutex_unlock(m) my_mutex_unlock(m)
+
+// Disable the default mutex
+// #define BQWS_SINGLE_THREAD 1
+
+// Renamed with .h suffix so the files don't build by default
+#include "bq_websocket.c.h"
+#include "bq_websocket_platform.c.h"
+```
+
 ## Usage
 
 ### Client (using bq_websocket_platform.h)
