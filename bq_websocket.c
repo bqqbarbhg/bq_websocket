@@ -68,9 +68,13 @@ static size_t bqws_timestamp_delta_to_ms(bqws_timestamp begin, bqws_timestamp en
 #endif
 #endif
 
+#ifndef BQWS_SINGLE_THREAD
+#define BQWS_SINGLE_THREAD 0
+#endif
+
 #ifndef bqws_mutex
 
-#if defined(_WIN32)
+#if defined(_WIN32) && !BQWS_SINGLE_THREAD
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -121,7 +125,7 @@ static void bqws_mutex_unlock(bqws_mutex *m)
 	#define bqws_assert_locked(m) (void)0
 #endif
 
-#elif (defined(__APPLE__) || defined(__linux__) || defined(__unix__)) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+#elif (defined(__APPLE__) || defined(__linux__) || defined(__unix__)) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)) && !BQWS_SINGLE_THREAD
 
 #include <pthread.h>
 
