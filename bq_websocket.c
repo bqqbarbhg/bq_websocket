@@ -1,5 +1,7 @@
 #include "bq_websocket.h"
 
+#if !defined(BQWS_USE_IMPL) || defined(BQWS_IMPL)
+
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -35,6 +37,18 @@
 #define bqws_assert(x) assert(x)
 #endif
 
+#ifndef bqws_malloc
+#define bqws_malloc(size) malloc((size))
+#endif
+
+#ifndef bqws_realloc
+#define bqws_realloc(ptr, size) realloc((ptr), (size))
+#endif
+
+#ifndef bqws_free
+#define bqws_free(ptr) free((ptr))
+#endif
+
 // TODO: QueryPerformanceCounter() or clock_gettime() might be faster
 typedef clock_t bqws_timestamp;
 
@@ -47,6 +61,8 @@ static size_t bqws_timestamp_delta_to_ms(bqws_timestamp begin, bqws_timestamp en
 {
 	return (size_t)((double)(end - begin) * 1000.0 / (double)CLOCKS_PER_SEC);
 }
+
+#ifndef bqws_mutex
 
 typedef struct {
 	bool is_locked;
@@ -74,6 +90,8 @@ static void bqws_mutex_unlock(bqws_mutex *m)
 }
 
 #define bqws_assert_locked(m) bqws_assert((m)->is_locked)
+
+#endif
 
 // -- Magic constants
 
@@ -469,7 +487,7 @@ static void *allocator_alloc(const bqws_allocator *at, size_t size)
 		return at->realloc_fn(at->user, NULL, 0, size);
 	} else {
 		// Default: malloc()
-		return malloc(size);
+		return bqws_malloc(size);
 	}
 }
 
@@ -499,7 +517,7 @@ static void *allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_s
 		return new_ptr;
 	} else {
 		// Default: realloc()
-		return realloc(ptr, new_size);
+		return bqws_realloc(ptr, new_size);
 	}
 }
 
@@ -518,7 +536,7 @@ static void allocator_free(const bqws_allocator *at, void *ptr, size_t size)
 		bqws_assert(at->alloc_fn == NULL);
 
 		// Default: free(), only if there is no user defined allocator
-		free(ptr);
+		bqws_free(ptr);
 	}
 }
 
@@ -3348,3 +3366,5 @@ static void bqws_sha1(uint8_t digest[20], const void *data, size_t size)
 	SHA1Update(&ctx, data, (uint32_t)size);
 	SHA1Final((unsigned char*)digest, &ctx);
 }
+
+#endif
