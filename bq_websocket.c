@@ -378,6 +378,7 @@ struct bqws_socket {
 		bool stop_read;
 		bool close_sent;
 		bool close_received;
+		bool io_started;
 		bool io_closed;
 
 		char *chosen_protocol;
@@ -476,6 +477,11 @@ static void ws_close(bqws_socket *ws)
 
 	if (ws->state.state != BQWS_STATE_CLOSED) {
 		ws_log(ws, "State: CLOSED");
+
+		if (ws->user_io.close_fn && !ws->state.io_closed) {
+			ws->user_io.close_fn(ws->user_io.user, ws);
+		}
+		ws->state.io_closed = true;
 
 		ws->state.state = BQWS_STATE_CLOSED;
 		ws->state.stop_read = true;
@@ -3120,11 +3126,17 @@ void bqws_update_io_read(bqws_socket *ws)
 
 	// If read and write are stopped close the IO
 	bqws_mutex_lock(&ws->state.mutex);
+	if (!ws->state.io_started) {
+		if (ws->user_io.init_fn) {
+			ws->user_io.init_fn(ws->user_io.user, ws);
+		}
+		ws->state.io_started = true;
+	}
 	if (ws->state.stop_read && ws->state.stop_write) {
 		if (ws->user_io.close_fn && !ws->state.io_closed) {
 			ws->user_io.close_fn(ws->user_io.user, ws);
-			ws->state.io_closed = true;
 		}
+		ws->state.io_closed = true;
 	}
 	do_read = !ws->state.stop_read;
 	bqws_mutex_unlock(&ws->state.mutex);
@@ -3152,11 +3164,17 @@ void bqws_update_io_write(bqws_socket *ws)
 
 	// If read and write are stopped close the IO
 	bqws_mutex_lock(&ws->state.mutex);
+	if (!ws->state.io_started) {
+		if (ws->user_io.init_fn) {
+			ws->user_io.init_fn(ws->user_io.user, ws);
+		}
+		ws->state.io_started = true;
+	}
 	if (ws->state.stop_read && ws->state.stop_write) {
 		if (ws->user_io.close_fn && !ws->state.io_closed) {
 			ws->user_io.close_fn(ws->user_io.user, ws);
-			ws->state.io_closed = true;
 		}
+		ws->state.io_closed = true;
 	}
 	do_write = !ws->state.stop_write;
 	bqws_mutex_unlock(&ws->state.mutex);

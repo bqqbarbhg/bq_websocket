@@ -138,6 +138,9 @@ typedef void bqws_free_fn(void *user, void *ptr, size_t size);
 
 // -- IO functions
 
+// Called once before anything else from the updating thread.
+typedef void bqws_io_init_fn(void *user, bqws_socket *ws);
+
 // Send `size` bytes of `data` to its peer.
 // Return the number of bytes actually sent or `SIZE_MAX` if an IO error occurred.
 typedef size_t bqws_io_send_fn(void *user, bqws_socket *ws, const void *data, size_t size);
@@ -186,6 +189,7 @@ typedef struct bqws_allocator {
 // see prototypes above for description
 typedef struct bqws_io {
 	void *user;
+	bqws_io_init_fn *init_fn;
 	bqws_io_send_fn *send_fn;
 	bqws_io_recv_fn *recv_fn;
 	bqws_io_notify_fn *notify_fn;

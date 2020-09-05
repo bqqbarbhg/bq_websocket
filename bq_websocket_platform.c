@@ -46,7 +46,7 @@ static void pt_fail_pt(const char *func, bqws_pt_error_code code)
 	t_err.data = code;
 }
 
-#if defined(__EMSCRIPTEN__) 
+#if defined(__EMSCRIPTEN__)
 
 #include <emscripten.h>
 
@@ -62,6 +62,11 @@ typedef struct {
 	pt_em_partial *partial_first;
 	pt_em_partial *partial_last;
 	size_t partial_size;
+
+	// Packed zero separated url + protocols
+	size_t num_protocols;
+	char *connect_data; 
+
 } pt_em_socket;
 
 EMSCRIPTEN_KEEPALIVE void *pt_em_msg_alloc(bqws_socket *ws, size_t size, int type)
@@ -84,7 +89,9 @@ EMSCRIPTEN_KEEPALIVE void pt_em_on_open(bqws_socket *ws)
 
 EMSCRIPTEN_KEEPALIVE void pt_em_on_close(bqws_socket *ws)
 {
+	pt_em_socket *em = (pt_em_socket*)bqws_get_io_user(ws);
 	bqws_direct_set_override_state(ws, BQWS_STATE_CLOSED);
+	em->handle = -1;
 }
 
 EM_JS(int, pt_em_connect_websocket, (bqws_socket *bqws, const char *url, const char **protocols, size_t num_protocols), {
@@ -123,11 +130,15 @@ EM_JS(int, pt_em_connect_websocket, (bqws_socket *bqws, const char *url, const c
 		if (Module.g_bqws_pt_sockets.sockets[handle] !== ws) return;
 
 		_pt_em_on_close(bqws);
+		Module.g_bqws_pt_sockets.sockets[handle] = null;
+		Module.g_bqws_pt_sockets.free_list.push(handle);
 	};
 	ws.onerror = function(e) {
 		if (Module.g_bqws_pt_sockets.sockets[handle] !== ws) return;
 
 		_pt_em_on_close(bqws);
+		Module.g_bqws_pt_sockets.sockets[handle] = null;
+		Module.g_bqws_pt_sockets.free_list.push(handle);
 	};
 
 	ws.onmessage = function(e) {
@@ -297,6 +308,25 @@ static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t s
 	return SIZE_MAX;
 }
 
+static void pt_io_init(void *user, bqws_socket *ws)
+{
+	pt_em_socket *em = (pt_em_socket*)user;
+	const char *protocols[BQWS_MAX_PROTOCOLS];
+	const char *url_str = em->connect_data;
+
+	const char *ptr = url_str;
+	for (size_t i = 0; i < em->num_protocols; i++) {
+		ptr += strlen(ptr);
+		protocols[i] = ptr;
+	}
+
+	int handle = pt_em_connect_websocket(ws, url_str, protocols, em->num_protocols);
+	em->handle = handle;
+
+	bqws_free(em->connect_data);
+	em->connect_data = NULL;
+}
+
 static void pt_io_close(void *user, bqws_socket *ws)
 {
 	pt_em_socket *em = (pt_em_socket*)user;
@@ -308,7 +338,14 @@ static void pt_io_close(void *user, bqws_socket *ws)
 		bqws_free(part);
 	}
 
-	pt_em_free_websocket(em->handle);
+	if (em->connect_data) {
+		bqws_free(em->connect_data);
+	}
+
+	if (em->handle >= 0) {
+		pt_em_free_websocket(em->handle);
+	}
+
 	em->magic = BQWS_PT_DELETED_MAGIC;
 	bqws_free(em);
 }
@@ -344,6 +381,7 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 	opt.send_message_fn = &pt_send_message;
 	opt.send_message_user = em;
 	opt.io.user = em;
+	opt.io.init_fn = &pt_io_init;
 	opt.io.send_fn = &pt_io_send;
 	opt.io.close_fn = &pt_io_close;
 	opt.skip_handshake = true;
@@ -356,8 +394,27 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 
 	bqws_direct_set_override_state(ws, BQWS_STATE_CONNECTING);
 
-	int handle = pt_em_connect_websocket(ws, url_str, copt.protocols, copt.num_protocols);
-	em->handle = handle;
+	// Retain connect data and connect at the first update
+	size_t url_size = strlen(url_str) + 1;
+	size_t protocol_size[BQWS_MAX_PROTOCOLS];
+	size_t connect_data_size = url_size + 1;
+	for (size_t i = 0; i < copt.num_protocols; i++) {
+		protocol_size[i] = strlen(copt.protocols[i]) + 1;
+		connect_data_size += protocol_size[i];
+	}
+	em->connect_data = (char*)bqws_malloc(connect_data_size);
+	em->num_protocols = copt.num_protocols;
+	{
+		char *ptr = em->connect_data;
+		memcpy(ptr, url_str, url_size);
+		ptr += url_size;
+		for (size_t i = 0; i < copt.num_protocols; i++) {
+			memcpy(ptr, copt.protocols[i], protocol_size[i]);
+			ptr += protocol_size[i];
+		}
+	}
+
+	em->handle = -1;
 
 	return ws;
 }
