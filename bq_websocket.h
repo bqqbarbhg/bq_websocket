@@ -140,6 +140,7 @@ typedef bool bqws_message_fn(void *user, bqws_socket *ws, bqws_msg *msg);
 typedef bool bqws_send_message_fn(void *user, bqws_socket *ws, bqws_msg *msg);
 typedef void bqws_peek_fn(void *user, bqws_socket *ws, bqws_msg *msg, bool received);
 typedef void bqws_log_fn(void *user, bqws_socket *ws, const char *line);
+typedef void bqws_error_fn(void *user, bqws_socket *ws, bqws_error error);
 
 typedef struct bqws_allocator {
 	void *user;
@@ -206,6 +207,10 @@ typedef struct bqws_opts {
 	// Log also send/receive events
 	bool log_send;
 	bool log_recv;
+
+	// Error callback
+	bqws_error_fn *error_fn;
+	void *error_user;
 
 	// Send messages manually without IO
 	bqws_send_message_fn *send_message_fn;

@@ -215,6 +215,8 @@ struct bqws_socket {
 	void *log_user;
 	bool log_send;
 	bool log_recv;
+	bqws_error_fn *error_fn;
+	void *error_user;
 	bqws_send_message_fn *send_message_fn;
 	void *send_message_user;
 	size_t user_size;
@@ -358,6 +360,7 @@ static void ws_close(bqws_socket *ws)
 static void ws_fail(bqws_socket *ws, bqws_error err)
 {
 	bool should_close = false;
+	bool should_report = false;
 
 	bqws_mutex_lock(&ws->state.mutex);
 
@@ -365,6 +368,8 @@ static void ws_fail(bqws_socket *ws, bqws_error err)
 
 	bqws_mutex_lock(&ws->err_mutex);
 	if (!ws->err) {
+		should_report = true;
+
 		// vvv Breakpoint here to stop on first error
 		ws->err = err;
 
@@ -433,6 +438,10 @@ static void ws_fail(bqws_socket *ws, bqws_error err)
 	if (err == BQWS_ERR_IO_WRITE) ws->state.stop_write = true;
 
 	bqws_mutex_unlock(&ws->state.mutex);
+
+	if (ws->error_fn && should_report) {
+		ws->error_fn(ws->error_user, ws, err);
+	}
 }
 
 static void bqws_sha1(uint8_t digest[20], const void *data, size_t size);
@@ -2245,6 +2254,8 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 	ws->log_user = opts->log_user;
 	ws->log_send = opts->log_send;
 	ws->log_recv = opts->log_recv;
+	ws->error_fn = opts->error_fn;
+	ws->error_user = opts->error_user;
 	ws->send_message_fn = opts->send_message_fn;
 	ws->send_message_user = opts->send_message_user;
 	ws->user_size = opts->user_size;
