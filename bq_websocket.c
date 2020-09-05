@@ -246,6 +246,7 @@ struct bqws_socket {
 		bqws_state override_state;
 
 		// Pre-allocated error close message storage
+		void *pointer_align;
 		char error_msg_data[sizeof(bqws_msg_imp) + sizeof(bqws_err_close_data)];
 		bqws_close_reason peer_reason;
 		bqws_error peer_err;
@@ -691,10 +692,12 @@ static void msg_free_owned(bqws_socket *ws, bqws_msg_imp *msg)
 
 	size_t size = msg_alloc_size(&msg->msg);
 
-	ws_remove_memory_used(ws, size);
+	if ((char*)msg != ws->state.error_msg_data) {
+		ws_remove_memory_used(ws, size);
 
-	bqws_allocator at = msg->allocator;
-	allocator_free(&at, msg, size);
+		bqws_allocator at = msg->allocator;
+		allocator_free(&at, msg, size);
+	}
 }
 
 static void msg_enqueue(bqws_msg_queue *mq, bqws_msg_imp *msg)
