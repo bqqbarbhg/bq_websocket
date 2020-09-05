@@ -86,8 +86,8 @@ typedef struct bqws_pt_listen_opts {
 	bool secure;
 
 	// TLS certificate, used only if `secure`
-	const char *certificate_file;
-	const char *private_key_file;
+	const char *certificate_file; // Passed to `SSL_CTX_use_certificate_file()`
+	const char *private_key_file; // Passed to `SSL_CTX_use_PrivateKey_file()`
 
 	// Port to bind to
 	// default: 80 if `!secure`, 443 if `secure`
@@ -104,6 +104,7 @@ typedef struct bqws_pt_listen_opts {
 
 // -- Global initialization
 
+// Call these before/after any other functions
 bool bqws_pt_init(const bqws_pt_init_opts *opts);
 void bqws_pt_shutdown();
 

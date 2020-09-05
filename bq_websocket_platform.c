@@ -1,7 +1,5 @@
 #include "bq_websocket_platform.h"
 
-#if !defined(BQWS_USE_IMPL) || defined(BQWS_IMPL)
-
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -1841,4 +1839,3 @@ const char *bqws_pt_error_code_str(bqws_pt_error_code err)
 	}
 }
 
-#endif

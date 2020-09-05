@@ -31,12 +31,15 @@ typedef enum bqws_error {
 	BQWS_ERR_LIMIT_MAX_HANDSHAKE_SIZE,
 	BQWS_ERR_LIMIT_MAX_PARTIAL_MESSAGE_PARTS,
 
+	// Peer didn't respond to handshake, PING, or CLOSE message in time
+	BQWS_ERR_CONNECT_TIMEOUT,
 	BQWS_ERR_PING_TIMEOUT,
 	BQWS_ERR_CLOSE_TIMEOUT,
 
 	// Allocator returned NULL
 	BQWS_ERR_ALLOCATOR,
 
+	// Protocol errors
 	BQWS_ERR_BAD_CONTINUATION,
 	BQWS_ERR_UNFINISHED_PARTIAL,
 	BQWS_ERR_PARTIAL_CONTROL,
@@ -51,6 +54,7 @@ typedef enum bqws_error {
 	BQWS_ERR_HEADER_KEY_TOO_LONG,
 	BQWS_ERR_HEADER_BAD_ACCEPT,
 	BQWS_ERR_HEADER_PARSE,
+
 } bqws_error;
 
 typedef enum bqws_state {
@@ -126,22 +130,51 @@ typedef struct bqws_msg {
 
 // Message header
 
+// -- Allocaiton functions
+
 typedef void *bqws_alloc_fn(void *user, size_t size);
 typedef void *bqws_realloc_fn(void *user, void *ptr, size_t old_size, size_t new_size);
 typedef void bqws_free_fn(void *user, void *ptr, size_t size);
 
+// -- IO functions
+
+// Send `size` bytes of `data` to its peer.
+// Return the number of bytes actually sent or `SIZE_MAX` if an IO error occurred.
 typedef size_t bqws_io_send_fn(void *user, bqws_socket *ws, const void *data, size_t size);
+
+// Read up to `max_size` bytes to `data`. It's safe to read `min_bytes` with blocking IO.
+// Return the number of bytes actually read or `SIZE_MAX` if an IO error occurred.
 typedef size_t bqws_io_recv_fn(void *user, bqws_socket *ws, void *data, size_t max_size, size_t min_size);
+
+// Notification that there is more data to send from the socket.
 typedef void bqws_io_notify_fn(void *user, bqws_socket *ws);
+
+// Flush all buffered data to the peer.
 typedef bool bqws_io_flush_fn(void *user, bqws_socket *ws);
+
+// Close and free all the resources used by the IO
 typedef void bqws_io_close_fn(void *user, bqws_socket *ws);
 
+// -- Miscellaneous callback functions
+
+// Called when the socket receives a message. Return `true` to consume/filter the message
+// preventing it from entering the `bqws_recv()` queue.
 typedef bool bqws_message_fn(void *user, bqws_socket *ws, bqws_msg *msg);
+
+// Send a message directly without IO, for example using native WebSockets on web.
+// Called repeatedly with the same message until you return `true`.
 typedef bool bqws_send_message_fn(void *user, bqws_socket *ws, bqws_msg *msg);
+
+// Peek at all messages (including control messages).
 typedef void bqws_peek_fn(void *user, bqws_socket *ws, bqws_msg *msg, bool received);
+
+// Log state transitions, errors and optionally sent/received messages.
 typedef void bqws_log_fn(void *user, bqws_socket *ws, const char *line);
+
+// Called when the socket encounters an error.
 typedef void bqws_error_fn(void *user, bqws_socket *ws, bqws_error error);
 
+// Allocator callbacks with user context pointer
 typedef struct bqws_allocator {
 	void *user;
 	bqws_alloc_fn *alloc_fn;
@@ -149,6 +182,8 @@ typedef struct bqws_allocator {
 	bqws_free_fn *free_fn;
 } bqws_allocator;
 
+// IO callbacks with user context pointer,
+// see prototypes above for description
 typedef struct bqws_io {
 	void *user;
 	bqws_io_send_fn *send_fn;
@@ -212,7 +247,7 @@ typedef struct bqws_opts {
 	bqws_error_fn *error_fn;
 	void *error_user;
 
-	// Send messages manually without IO
+	// Send messages from this socket manually without IO
 	bqws_send_message_fn *send_message_fn;
 	void *send_message_user;
 
@@ -220,6 +255,11 @@ typedef struct bqws_opts {
 	// the data will be zero-initialized
 	void *user_data;
 	size_t user_size;
+
+	// How long to wait (milliseconds) for the connecting to succeed before giving up.
+	// Use SIZE_MAX to disable the timeout.
+	// default: 10000
+	size_t connect_timeout;
 
 	// How often (milliseconds) to send PING messages if there is no traffic,
 	// use SIZE_MAX to disable automatic PING
@@ -258,30 +298,29 @@ typedef struct bqws_opts {
 
 } bqws_opts;
 
+#define BQWS_MAX_HEADERS 64
+#define BQWS_MAX_PROTOCOLS 64
+
+// HTTP header key-value pair.
 typedef struct bqws_header {
 	const char *name;
 	const char *value;
 } bqws_header;
 
-#define BQWS_MAX_HEADERS 64
-#define BQWS_MAX_PROTOCOLS 64
-
 typedef struct bqws_client_opts {
 
-	// Headers
+	// Standard HTTP headers used by the handshake
 	const char *path;
 	const char *host;
 	const char *origin;
 
+	// WebSocket protocols to request
 	const char *protocols[BQWS_MAX_PROTOCOLS];
 	size_t num_protocols;
 
+	// Extra HTTP headers
 	bqws_header headers[BQWS_MAX_HEADERS];
 	size_t num_headers;
-
-	// Random seed
-	char random_key[16];
-	char random_key_base64[32];
 
 } bqws_client_opts;
 
@@ -290,7 +329,7 @@ typedef void bqws_verify_fn(void *user, bqws_socket *ws, const bqws_client_opts 
 
 typedef struct bqws_server_opts {
 
-	// Automatically verify connections matching this filter
+	// Automatically verify connections matching these client options.
 	bqws_client_opts *verify_filter;
 
 	// Verify callback, same as polling `bqws_server_get_client_options()`
@@ -300,6 +339,8 @@ typedef struct bqws_server_opts {
 
 } bqws_server_opts;
 
+// [wss://][host.example.com][:12345][/directory]
+//  scehme       host          port      path
 typedef struct bqws_url {
 	bool secure;
 	uint16_t port;
@@ -323,26 +364,32 @@ typedef struct bqws_stats {
 
 // -- WebSocket management
 
+// Create a new client/server socket. `opts`, `client_opts`, `server_opts` are all optional.
 bqws_socket *bqws_new_client(const bqws_opts *opts, const bqws_client_opts *client_opts);
 bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *server_opts);
+
+// Call at any point to destroy the socket and free all used resources.
 void bqws_free_socket(bqws_socket *ws);
 
-// Graceful shutdown
+// Graceful shutdown: Prepare to close the socket by sending a close message.
+// `bqws_close()` sends the close message as soon as possible while `bqws_queue_close()`
+// sends all other queued messages first.
 void bqws_close(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size);
 void bqws_queue_close(bqws_socket *ws, bqws_close_reason reason, const void *data, size_t size);
 
 // -- Server connect
 
 // Accept or reject connections based on headers.
-// Valid only until `bqws_server_connect()` or `bqws_free_socket()`!
+// Valid only until you call `bqws_server_connect()` or `bqws_free_socket()`!
 bqws_client_opts *bqws_server_get_client_opts(bqws_socket *ws);
 void bqws_server_accept(bqws_socket *ws, const char *protocol);
 void bqws_server_reject(bqws_socket *ws);
 
-// -- State query
+// -- Query state
 
 bqws_state bqws_get_state(const bqws_socket *ws);
 bqws_error bqws_get_error(const bqws_socket *ws);
+bool bqws_is_connecting(const bqws_socket *ws);
 bool bqws_is_closed(const bqws_socket *ws);
 size_t bqws_get_memory_used(const bqws_socket *ws);
 bool bqws_is_server(const bqws_socket *ws);
@@ -364,6 +411,8 @@ bqws_error bqws_get_peer_error(const bqws_socket *ws);
 // Get the chosen protocol, returns "" if none chosen but the connection is open
 // Returns NULL if the connection is not established
 const char *bqws_get_protocol(const bqws_socket *ws);
+
+// -- Communication
 
 // Receive a message, use `bqws_free_msg()` to free the returned pointer
 bqws_msg *bqws_recv(bqws_socket *ws);
@@ -390,16 +439,21 @@ void bqws_send_finish(bqws_socket *ws);
 void bqws_send_ping(bqws_socket *ws, const void *data, size_t size);
 void bqws_send_pong(bqws_socket *ws, const void *data, size_t size);
 
+// -- Updating and IO
+
 // Keep the socket alive, reads/writes buffered data and responds to pings/pongs
 // Semantically equivalent to bqws_update_state() and bqws_update_io()
 void bqws_update(bqws_socket *ws);
 
+// Send/respond to PING/PONG, update close timeouts, etc...
 void bqws_update_state(bqws_socket *ws);
+
+// Call user-provided IO callbacks for reading/writing or both.
 void bqws_update_io(bqws_socket *ws);
 void bqws_update_io_read(bqws_socket *ws);
 void bqws_update_io_write(bqws_socket *ws);
 
-// Manual IO
+// Non-callback IO: Read data to send to the peer or write data received from the peer.
 size_t bqws_read_from(bqws_socket *ws, const void *data, size_t size);
 size_t bqws_write_to(bqws_socket *ws, void *data, size_t size);
 
@@ -410,8 +464,11 @@ void bqws_direct_fail(bqws_socket *ws, bqws_error err);
 
 // -- Utility
 
+// Parse `str` to `url` returning `true` on success.
+// `url->path` still refers to `str` and is not a copy!
 bool bqws_parse_url(bqws_url *url, const char *str);
 
+// Enum -> string conversion
 const char *bqws_error_str(bqws_error error);
 const char *bqws_msg_type_str(bqws_msg_type type);
 const char *bqws_state_str(bqws_state state);

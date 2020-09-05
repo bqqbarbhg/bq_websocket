@@ -1,7 +1,5 @@
 #include "bq_websocket.h"
 
-#if !defined(BQWS_USE_IMPL) || defined(BQWS_IMPL)
-
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -99,8 +97,6 @@ static void bqws_mutex_unlock(bqws_mutex *m)
 #define BQWS_SOCKET_MAGIC    0x7773636b
 #define BQWS_MSG_MAGIC       0x776d7367
 #define BQWS_FILTER_MAGIC    0x77666c74
-
-#define CLIENT_KEY_BASE64_MAX_SIZE 32
 
 // -- Types
 
@@ -221,6 +217,7 @@ struct bqws_socket {
 	void *send_message_user;
 	size_t user_size;
 	size_t ping_interval;
+	size_t connect_timeout;
 	size_t close_timeout;
 	size_t ping_response_timeout;
 
@@ -279,6 +276,7 @@ struct bqws_socket {
 	struct {
 		bqws_mutex mutex;
 
+		bqws_timestamp start_connect_ts;
 		bqws_timestamp last_write_ts;
 		bqws_timestamp last_read_ts;
 		bqws_timestamp last_ping_ts;
@@ -288,7 +286,7 @@ struct bqws_socket {
 		bqws_handshake_buffer handshake;
 		bqws_handshake_buffer handshake_overflow;
 		bqws_client_opts *opts_from_client;
-		char *client_key_base64;
+		char client_key_base64[32];
 		bool client_handshake_done;
 		bool client_has_protocol;
 
@@ -992,13 +990,9 @@ static void hs_client_handshake(bqws_socket *ws, const bqws_client_opts *opts)
 	bqws_sha1(digest, &entropy, sizeof(entropy));
 
 	// We need to retain the key until we have parsed the server handshake
-	char *key = ws_alloc(ws, CLIENT_KEY_BASE64_MAX_SIZE);
-	if (!key) return;
-	ws->io.client_key_base64 = key;
-
-	bool ret = hs_to_base64(key, CLIENT_KEY_BASE64_MAX_SIZE, digest, 16);
+	bool ret = hs_to_base64(ws->io.client_key_base64, sizeof(ws->io.client_key_base64), digest, 16);
 	bqws_assert(ret == true); // 32 bytes should always be enough
-	hs_push3(ws, "Sec-WebSocket-Key: ", key, "\r\n");
+	hs_push3(ws, "Sec-WebSocket-Key: ", ws->io.client_key_base64, "\r\n");
 
 	// Final CRLF
 	hs_push(ws, "\r\n");
@@ -1031,7 +1025,7 @@ static void hs_server_handshake(bqws_socket *ws)
 
 	// SHA-1 challenge
 	char accept[32];
-	hs_solve_challenge(accept, ws->io.opts_from_client->random_key_base64);
+	hs_solve_challenge(accept, ws->io.client_key_base64);
 	hs_push3(ws, "Sec-WebSocket-Accept: ", accept, "\r\n");
 
 	// Final CRLF
@@ -1167,11 +1161,11 @@ static bool hs_parse_client_handshake(bqws_socket *ws)
 			pos = cur_pos;
 		} else if (streq_ic(header->name, "Sec-Websocket-Key")) {
 			size_t len = strlen(header->value) + 1;
-			if (len > sizeof(opts->random_key_base64)) {
+			if (len > sizeof(ws->io.client_key_base64)) {
 				ws_fail(ws, BQWS_ERR_HEADER_KEY_TOO_LONG);
 				return false;
 			}
-			memcpy(opts->random_key_base64, header->value, len);
+			memcpy(ws->io.client_key_base64, header->value, len);
 		} else if (streq_ic(header->name, "Sec-Websocket-Version")) {
 			// TODO: Version negotiatoin
 			if (strcmp(header->value, "13") != 0) {
@@ -1198,7 +1192,6 @@ static bool hs_parse_server_handshake(bqws_socket *ws)
 	bqws_assert_locked(&ws->io.mutex);
 
 	bqws_assert(!ws->is_server);
-	bqws_assert(ws->io.client_key_base64);
 
 	size_t pos = 0;
 
@@ -1229,10 +1222,6 @@ static bool hs_parse_server_handshake(bqws_socket *ws)
 				ws_fail(ws, BQWS_ERR_HEADER_BAD_ACCEPT);
 				return false;
 			}
-
-			// Free the client key
-			ws_free(ws, ws->io.client_key_base64, CLIENT_KEY_BASE64_MAX_SIZE);
-			ws->io.client_key_base64 = NULL;
 
 		} else if (streq_ic(header.name, "Sec-Websocket-Protocol")) {
 			// Protocol that the server chose
@@ -1315,11 +1304,11 @@ static void hs_store_handshake_overflow(bqws_socket *ws)
 
 static void ws_enqueue_send(bqws_socket *ws, bqws_msg_imp *msg)
 {
+	msg_enqueue(&ws->send_queue, msg);
+
 	if (ws->user_io.notify_fn) {
 		ws->user_io.notify_fn(ws->user_io.user, ws);
 	}
-
-	msg_enqueue(&ws->send_queue, msg);
 }
 
 static void ws_enqueue_recv(bqws_socket *ws, bqws_msg_imp *msg)
@@ -2281,12 +2270,14 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 		ws->ping_interval = is_server ? 20000 : 10000;
 	}
 
+	ws->connect_timeout = opts->connect_timeout ? opts->connect_timeout : 10000;
 	ws->close_timeout = opts->close_timeout ? opts->close_timeout : 5000;
 	ws->ping_response_timeout = opts->ping_response_timeout ? opts->ping_response_timeout : 4 * ws->ping_interval;
 
 	bqws_assert(ws->ping_interval > 0);
-	if (ws->ping_interval != SIZE_MAX) {
+	if (ws->ping_interval != SIZE_MAX || ws->connect_timeout != SIZE_MAX) {
 		bqws_timestamp ts = bqws_get_timestamp();
+		ws->io.start_connect_ts = ts;
 		ws->io.last_write_ts = ts;
 		ws->io.last_read_ts = ts;
 		ws->io.last_ping_ts = ts;
@@ -2495,7 +2486,6 @@ void bqws_free_socket(bqws_socket *ws)
 	if (ws->partial.next_partial_to_send) msg_free_owned(ws, ws->partial.next_partial_to_send);
 
 	// Misc buffers
-	if (ws->io.client_key_base64) ws_free(ws, ws->io.client_key_base64, CLIENT_KEY_BASE64_MAX_SIZE);
 	if (ws->io.opts_from_client) ws_free(ws, ws->io.opts_from_client, sizeof(bqws_client_opts));
 
 	// String copies
@@ -2570,6 +2560,16 @@ bqws_error bqws_get_error(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	return ws->err;
+}
+
+bool bqws_is_connecting(const bqws_socket *ws)
+{
+	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
+	// No mutex! We can always underestimate the state
+	bqws_state state = ws->state.state;
+	bqws_state override_state = ws->state.override_state;
+	if (override_state > state) state = override_state;
+	return state == BQWS_STATE_CONNECTING;
 }
 
 bool bqws_is_closed(const bqws_socket *ws)
@@ -2908,6 +2908,19 @@ void bqws_update_state(bqws_socket *ws)
 			ws->verify_fn(ws->verify_user, ws, ws->io.opts_from_client);
 		}
 
+		// Connect timeout
+		if (ws->connect_timeout != SIZE_MAX && state == BQWS_STATE_CONNECTING) {
+			bqws_timestamp time = bqws_get_timestamp();
+			size_t delta = bqws_timestamp_delta_to_ms(ws->io.start_connect_ts, time);
+			if (delta > ws->connect_timeout) {
+				ws_fail(ws, BQWS_ERR_CONNECT_TIMEOUT);
+
+				bqws_mutex_lock(&ws->state.mutex);
+				ws_close(ws);
+				bqws_mutex_unlock(&ws->state.mutex);
+			}
+		}
+
 	} else if (state == BQWS_STATE_OPEN) {
 
 		// Automatic PING send
@@ -3124,6 +3137,7 @@ bool bqws_parse_url(bqws_url *url, const char *str)
 	if (*host == '[') {
 		// Skip IPv6 address
 		port_start = strstr(host, "]");
+		if (!port_start) return false;
 	}
 	const char *port = strstr(port_start, ":");
 	const char *path = strstr(port_start, "/");
@@ -3176,6 +3190,7 @@ const char *bqws_error_str(bqws_error error)
 	case BQWS_ERR_LIMIT_MAX_RECV_MSG_SIZE: return "LIMIT_MAX_RECV_MSG_SIZE";
 	case BQWS_ERR_LIMIT_MAX_HANDSHAKE_SIZE: return "LIMIT_MAX_HANDSHAKE_SIZE";
 	case BQWS_ERR_LIMIT_MAX_PARTIAL_MESSAGE_PARTS: return "LIMIT_MAX_PARTIAL_MESSAGE_PARTS";
+	case BQWS_ERR_CONNECT_TIMEOUT: return "BQWS_ERR_CONNECT_TIMEOUT";
 	case BQWS_ERR_PING_TIMEOUT: return "BQWS_ERR_PING_TIMEOUT";
 	case BQWS_ERR_CLOSE_TIMEOUT: return "BQWS_ERR_CLOSE_TIMEOUT";
 	case BQWS_ERR_ALLOCATOR: return "ALLOCATOR";
@@ -3225,7 +3240,7 @@ const char *bqws_state_str(bqws_state state)
 	}
 }
 
-// TODO: Add define for this
+// TODO: Add a define for this
 
 /* ================ sha1.c ================ */
 /*
@@ -3381,4 +3396,3 @@ static void bqws_sha1(uint8_t digest[20], const void *data, size_t size)
 	SHA1Final((unsigned char*)digest, &ctx);
 }
 
-#endif
