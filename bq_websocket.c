@@ -163,6 +163,9 @@ typedef struct {
 	const char *protocols[BQWS_MAX_PROTOCOLS];
 	size_t num_protocols;
 
+	bqws_verify_fn *verify_fn;
+	void *verify_user;
+
 	size_t text_size;
 	char text_data[];
 } bqws_verify_filter;
@@ -2180,7 +2183,7 @@ static void bqws_internal_filter_verify(void *user, bqws_socket *ws, const bqws_
 
 	const char *protocol = NULL;
 	if (f->num_protocols > 0) {
-		// If the fitler has protocols try to find one
+		// If the filter has protocols try to find one
 		// O(n^2) but bounded by BQWS_MAX_PROTOCOLS
 		for (size_t ci = 0; ci < opts->num_protocols && !protocol; ci++) {
 			for (size_t fi = 0; fi < f->num_protocols; fi++) {
@@ -2198,7 +2201,11 @@ static void bqws_internal_filter_verify(void *user, bqws_socket *ws, const bqws_
 
 	if (ok) {
 		bqws_assert(protocol != NULL);
-		bqws_server_accept(ws, protocol);
+		if (f->verify_fn) {
+			f->verify_fn(f->verify_user, ws, opts);
+		} else {
+			bqws_server_accept(ws, protocol);
+		}
 	} else {
 		bqws_server_reject(ws);
 	}
@@ -2357,7 +2364,7 @@ bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *serv
 		ws->verify_user = server_opts->verify_user;
 
 		// Setup automatic verify filter if needed
-		if (server_opts->verify_filter && !ws->verify_fn) {
+		if (server_opts->verify_filter) {
 			bqws_client_opts *filter = server_opts->verify_filter;
 			size_t text_size = 0;
 
@@ -2390,6 +2397,8 @@ bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *serv
 
 			bqws_assert(offset == text_size);
 
+			copy->verify_fn = ws->verify_fn;
+			copy->verify_user = ws->verify_user;
 			ws->verify_fn = &bqws_internal_filter_verify;
 			ws->verify_user = copy;
 		}
