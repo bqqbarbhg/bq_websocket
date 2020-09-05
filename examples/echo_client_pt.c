@@ -90,7 +90,7 @@ int main(int argc, char **argv)
 	bqws_opts opts = { 0 };
 	opts.log_fn = &log;
 
-	ws = bqws_pt_connect("wss://demos.kaazing.com/echo", NULL, &opts, NULL);
+	ws = bqws_pt_connect("wss://echo.websocket.org", NULL, &opts, NULL);
 	if (!ws) {
 		fprintf(stderr, "bqws_pt_connect() failed\n");
 		log_pt_error();
