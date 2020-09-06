@@ -110,7 +110,7 @@ def build_exe(exe):
         args += IGNORE_WARNINGS
         args += CC_FLAGS
         args += ("-D" + d for d in exe.defines)
-        args += "-I.."
+        args += ["-I.."]
         args += LD_FLAGS
         args += ["-o", exe.name]
         run_cmd(args)
