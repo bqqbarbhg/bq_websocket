@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdio.h>
 
 // -- Generic
 
@@ -77,6 +76,11 @@ typedef struct {
 	bqws_allocator allocator;
 
 } pt_em_socket;
+
+static void pt_sleep_ms(uint32_t ms)
+{
+	emscripten_sleep(ms);
+}
 
 static void pt_em_free(pt_em_socket *em)
 {
@@ -612,6 +616,11 @@ static void pt_fail_wsa(const char *func)
 	t_err.data = (uint32_t)WSAGetLastError();
 }
 
+static void pt_sleep_ms(uint32_t ms)
+{
+	Sleep((DWORD)ms);
+}
+
 static bool os_init(const bqws_pt_init_opts *opts)
 {
 	WSADATA data;
@@ -836,6 +845,14 @@ static void pt_fail_posix(const char *func)
 	t_err.function = func;
 	t_err.type = BQWS_PT_ERRTYPE_POSIX;
 	t_err.data = errno;
+}
+
+static void pt_sleep_ms(uint32_t ms)
+{
+	struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    while (nanosleep(&ts, &ts)) { }
 }
 
 static bool os_init(const bqws_pt_init_opts *opts)
@@ -2002,6 +2019,11 @@ void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err)
 		break;
 
 	}
+}
+
+void bqws_pt_sleep_ms(uint32_t ms)
+{
+	pt_sleep_ms(ms);
 }
 
 const char *bqws_pt_error_type_str(bqws_pt_error_type type)

@@ -19,7 +19,6 @@ The library is dual licensed under **public domain** and **MIT**, you can choose
 ```c
 #include "bq_websocket.h"
 #include "bq_websocket_platform.h"
-#include <time.h> // For sleep()
 #include <stdio.h> // For printf()
 
 int main()
@@ -41,7 +40,7 @@ int main()
             bqws_free_msg(msg);
             break;
         }
-        sleep(1);
+        bqws_pt_sleep_ms(10);
     }
 
     bqws_free_socket(ws);

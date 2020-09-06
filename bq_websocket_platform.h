@@ -139,6 +139,8 @@ void bqws_pt_format_address(char *dst, size_t size, const bqws_pt_address *addr)
 
 void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err);
 
+void bqws_pt_sleep_ms(uint32_t ms);
+
 const char *bqws_pt_error_type_str(bqws_pt_error_type type);
 const char *bqws_pt_error_code_str(bqws_pt_error_code err);
 
