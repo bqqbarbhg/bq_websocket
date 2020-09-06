@@ -823,6 +823,7 @@ static void msg_free_owned(bqws_socket *ws, bqws_msg_imp *msg)
 
 	size_t size = msg_alloc_size(&msg->msg);
 
+	// no-mutex(state): We are only referring to the address of `error_msg_data`
 	if ((char*)msg != ws->state.error_msg_data) {
 		ws_remove_memory_used(ws, size);
 
@@ -1365,17 +1366,17 @@ static bool hs_parse_server_handshake(bqws_socket *ws)
 			// Protocol that the server chose
 
 			// Keep the first one if there's duplicates
+			bqws_mutex_lock(&ws->state.mutex);
 			if (!ws->state.chosen_protocol) {
 				char *copy = ws_copy_str(ws, header.value);
 
-				bqws_mutex_lock(&ws->state.mutex);
 				if (!ws->state.chosen_protocol) {
 					ws->state.chosen_protocol = copy;
 				} else {
 					ws_free_str(ws, copy);
 				}
-				bqws_mutex_unlock(&ws->state.mutex);
 			}
+			bqws_mutex_unlock(&ws->state.mutex);
 		}
 	}
 
@@ -1384,17 +1385,17 @@ static bool hs_parse_server_handshake(bqws_socket *ws)
 	ws->io.handshake.read_offset = pos;
 
 	// If the server didn't choose any protocol set it as ""
+	bqws_mutex_lock(&ws->state.mutex);
 	if (!ws->state.chosen_protocol) {
 		char *copy = ws_copy_str(ws, "");
 
-		bqws_mutex_lock(&ws->state.mutex);
 		if (!ws->state.chosen_protocol) {
 			ws->state.chosen_protocol = copy;
 		} else {
 			ws_free_str(ws, copy);
 		}
-		bqws_mutex_unlock(&ws->state.mutex);
 	}
+	bqws_mutex_unlock(&ws->state.mutex);
 
 	return true;
 }
@@ -2656,7 +2657,8 @@ bqws_client_opts *bqws_server_get_client_opts(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	bqws_assert(ws->is_server);
-	bqws_assert(ws->state.state == BQWS_STATE_CONNECTING);
+	// no-mutex(state): There's an inherent race condition with multiple accepts
+	bqws_assert(ws->state.state == BQWS_STATE_CONNECTING); 
 
 	bqws_mutex_lock(&ws->io.mutex);
 	bqws_client_opts *opts = ws->io.opts_from_client;
@@ -2669,6 +2671,7 @@ void bqws_server_accept(bqws_socket *ws, const char *protocol)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	bqws_assert(ws->is_server);
+	// no-mutex(state): There's an inherent race condition with multiple accepts
 	bqws_assert(ws->state.state == BQWS_STATE_CONNECTING);
 	if (ws->err) return;
 
@@ -2693,9 +2696,8 @@ void bqws_server_reject(bqws_socket *ws)
 bqws_state bqws_get_state(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	// No mutex! We can always underestimate the state
-	bqws_state state = ws->state.state;
-	bqws_state override_state = ws->state.override_state;
+	// no-mutex(state): We can always underestimate the state
+	bqws_state state = ws->state.state, override_state = ws->state.override_state;
 	if (override_state > state) state = override_state;
 	return state;
 }
@@ -2709,9 +2711,8 @@ bqws_error bqws_get_error(const bqws_socket *ws)
 bool bqws_is_connecting(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	// No mutex! We can always underestimate the state
-	bqws_state state = ws->state.state;
-	bqws_state override_state = ws->state.override_state;
+	// no-mutex(state): We can always underestimate the state
+	bqws_state state = ws->state.state, override_state = ws->state.override_state;
 	if (override_state > state) state = override_state;
 	return state == BQWS_STATE_CONNECTING;
 }
@@ -2719,9 +2720,8 @@ bool bqws_is_connecting(const bqws_socket *ws)
 bool bqws_is_closed(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	// No mutex! We can always underestimate the state
-	bqws_state state = ws->state.state;
-	bqws_state override_state = ws->state.override_state;
+	// no-mutex(state): We can always underestimate the state
+	bqws_state state = ws->state.state, override_state = ws->state.override_state;
 	if (override_state > state) state = override_state;
 	return state == BQWS_STATE_CLOSED;
 }
@@ -2729,7 +2729,7 @@ bool bqws_is_closed(const bqws_socket *ws)
 size_t bqws_get_memory_used(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	// No mutex! This doesn't need to be accurate
+	// no-mutex(alloc): This doesn't need to be accurate
 	return ws->alloc.memory_used;
 }
 
@@ -2778,6 +2778,7 @@ bool bqws_get_io_closed(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 
+	// no-mutex(state): This can be inaccurate
 	return ws->state.io_closed;
 }
 
@@ -2823,7 +2824,7 @@ const char *bqws_get_protocol(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 
-	// TODO: Cache this pointer outside of IO mutex
+	// TODO: Cache this pointer outside of the state mutex
 	bqws_mutex_lock((bqws_mutex*)&ws->state.mutex);
 	const char *protocol = ws->state.chosen_protocol;
 	bqws_mutex_unlock((bqws_mutex*)&ws->state.mutex);
