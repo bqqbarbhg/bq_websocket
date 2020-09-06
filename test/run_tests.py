@@ -161,6 +161,7 @@ def run_exe(exe):
         # TODO: Asyncify can't call C functions ?!?!
         if exe.use_asyncify:
             print("TODO: Skipped, cannot call C if using -S ASYNCIFY (?)")
+            return
         args = ["node", exe.name]
         args += exe.args
         if verbose: args += ["-v"]
