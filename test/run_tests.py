@@ -6,6 +6,7 @@ import os
 import sys
 import subprocess
 import shlex
+import re
 
 verbose = "-v" in sys.argv
 
@@ -56,6 +57,33 @@ def run_cmd(args):
     print("$ " + " ".join(shlex.quote(a) for a in args), flush=True)
     subprocess.check_call(args)
 
+def extract_readme_examples():
+    print("=== Extracting README examples ===")
+    RE_EXAMPLE = re.compile(r"\s*\[//\]:\s*#example\s+(\w+\.c)\s*")
+    with open("../README.md") as f:
+        file_name = None
+        lines = []
+        for line in f:
+            line = line.rstrip()
+            m = RE_EXAMPLE.match(line)
+            if m:
+                file_name = m.group(1)
+                lines = []
+                continue
+            if file_name:
+                if line.strip() == "```c":
+                    continue
+                elif line.strip() == "```":
+                    print("Found: {} ({} lines)".format(file_name, len(lines)))
+                    with open(file_name, "w") as wf:
+                        wf.write("\n".join(lines))
+                        wf.write("\n")
+                    lines = []
+                    file_name = None
+                else:
+                    lines.append(line)
+
+
 def build_exe(exe):
     if not exe.sources: return
     print("=== Building {} ===".format(exe.name), flush=True)
@@ -68,6 +96,7 @@ def build_exe(exe):
         args += IGNORE_WARNINGS
         args += CL_FLAGS
         args += ("-D" + d for d in exe.defines)
+        args += ["-I", ".."]
         args += ["-link"]
         args += LD_FLAGS
         args += ["-out:{}.exe".format(exe.name)]
@@ -81,6 +110,7 @@ def build_exe(exe):
         args += IGNORE_WARNINGS
         args += CC_FLAGS
         args += ("-D" + d for d in exe.defines)
+        args += "-I.."
         args += LD_FLAGS
         args += ["-o", exe.name]
         run_cmd(args)
@@ -132,9 +162,16 @@ TEST_EXES = [
         sources=["bq_websocket.c", "bq_websocket_platform.c", "examples/echo_client_pt.c"],
         defines=["NO_TLS"],
     ),
+    TestExe(
+        name="readme_client_usage",
+        sources=["bq_websocket.c", "bq_websocket_platform.c", "build/readme_client_usage.c"],
+    ),
 ]
 
 extract_tar_gz("../test/fuzz/fuzz_test_cases.tar.gz")
+
+extract_readme_examples()
+
 if sys.platform == "win32":
     init_vsvars()
 
