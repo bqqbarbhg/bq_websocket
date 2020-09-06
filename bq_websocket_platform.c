@@ -1339,7 +1339,7 @@ static size_t cf_send(pt_cf *cf, const void *data, size_t size)
     
     if (!cf->set_nonblocking) {
         cf->set_nonblocking = true;
-        CFDataRef socket_data = CFWriteStreamCopyProperty(cf->write, kCFStreamPropertySocketNativeHandle);
+        CFDataRef socket_data = (CFDataRef)CFWriteStreamCopyProperty(cf->write, kCFStreamPropertySocketNativeHandle);
         if (socket_data) {
             CFSocketNativeHandle s = -1;
             CFDataGetBytes(socket_data, CFRangeMake(0, sizeof(CFSocketNativeHandle)), (UInt8*)&s);
@@ -1351,7 +1351,7 @@ static size_t cf_send(pt_cf *cf, const void *data, size_t size)
         }
     }
     
-    CFIndex res = CFWriteStreamWrite(cf->write, data, size);
+    CFIndex res = CFWriteStreamWrite(cf->write, (const UInt8*)data, size);
     if (res < 0) return SIZE_MAX;
     return (size_t)res;
 }
@@ -1415,7 +1415,7 @@ static void cf_get_address(pt_cf *cf, bqws_pt_address *address)
     if (!cf->has_address) {
         cf->has_address = true;
         
-        CFDataRef socket_data = CFWriteStreamCopyProperty(cf->write, kCFStreamPropertySocketNativeHandle);
+        CFDataRef socket_data = (CFDataRef)CFWriteStreamCopyProperty(cf->write, kCFStreamPropertySocketNativeHandle);
         if (socket_data) {
             CFSocketNativeHandle s = -1;
             CFDataGetBytes(socket_data, CFRangeMake(0, sizeof(CFSocketNativeHandle)), (UInt8*)&s);
@@ -1612,13 +1612,13 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
         memset(io, 0, sizeof(pt_io));
 		io->allocator = opts->allocator;
         io->s = OS_BAD_SOCKET;
+	io->magic = BQWS_PT_IO_MAGIC;
 
         if (!cf_connect(url, &io->cf)) {
     		bqws_pt_address addr = { BQWS_PT_ADDRESS_UNKNOWN };
     		io->s = os_socket_connect(url, &addr);
     		if (io->s == OS_BAD_SOCKET) break;
 
-    		io->magic = BQWS_PT_IO_MAGIC;
     		io->address = addr;
 
     		if (url->secure) {
@@ -1746,8 +1746,7 @@ static bqws_pt_address pt_get_address(const bqws_socket *ws)
 {
 	pt_io *io = (pt_io*)bqws_get_io_user(ws);
 	bqws_assert(io && io->magic == BQWS_PT_IO_MAGIC);
-    
-    if (cf_enabled(&io->cf)) cf_get_address(&io->cf, &io->address);
+    	if (cf_enabled(&io->cf)) cf_get_address(&io->cf, &io->address);
     
 	return io->address;
 }
