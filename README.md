@@ -19,6 +19,7 @@ The library is dual licensed under **public domain** and **MIT**, you can choose
 ```c
 #include "bq_websocket.h"
 #include "bq_websocket_platform.h"
+#include <time.h> // For sleep()
 
 int main()
 {
