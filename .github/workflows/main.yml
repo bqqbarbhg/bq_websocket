@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - name: Run tests
-        run: python3 test/run_tests.py
+        run: python3 test/run_tests.py --no-gcc
 
   ci_emscripten:
     runs-on: ubuntu-latest

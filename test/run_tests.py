@@ -11,6 +11,7 @@ import shutil
 
 verbose = "-v" in sys.argv
 emscripten = "--emscripten" in sys.argv
+no_gcc = "--no-gcc" in sys.argv
 
 self_path = os.path.dirname(os.path.abspath(__file__))
 root_path = os.path.join(self_path, "..")
@@ -127,6 +128,8 @@ def build_exe(exe):
 
         if emscripten:
             ccs = ["emcc"]
+        elif no_gcc:
+            ccs = ["clang"]
         else:
             ccs = ["gcc", "clang"]
 
