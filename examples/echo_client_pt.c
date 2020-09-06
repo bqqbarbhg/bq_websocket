@@ -37,14 +37,14 @@ static void log_pt_error()
 	}
 }
 
-void main_loop()
+bool main_loop()
 {
-	if (!ws) return;
+	if (!ws) return true;
 
 	bqws_update(ws);
 
 	if (num_recv >= 3) {
-		if (timer++ % 100 == 0) {
+		if (timer++ % 10 == 0) {
 			counter++;
 			char msg[32];
 			snprintf(msg, sizeof(msg), "%zu", counter);
@@ -75,12 +75,16 @@ void main_loop()
 
 		log_pt_error();
 	}
+
+	return false;
 }
 
 int main(int argc, char **argv)
 {
 	bqws_pt_init_opts init_opts = { 0 };
-	init_opts.ca_filename = "cacert.pem";
+	#if !defined(NO_TLS)
+		init_opts.ca_filename = "cacert.pem";
+	#endif
 	if (!bqws_pt_init(&init_opts)) {
 		fprintf(stderr, "bqws_pt_init() failed\n");
 		log_pt_error();
@@ -90,7 +94,12 @@ int main(int argc, char **argv)
 	bqws_opts opts = { 0 };
 	opts.log_fn = &log;
 
-	ws = bqws_pt_connect("wss://echo.websocket.org", NULL, &opts, NULL);
+	#if !defined(NO_TLS)
+		ws = bqws_pt_connect("wss://echo.websocket.org", NULL, &opts, NULL);
+	#else
+		ws = bqws_pt_connect("ws://echo.websocket.org", NULL, &opts, NULL);
+	#endif
+
 	if (!ws) {
 		fprintf(stderr, "bqws_pt_connect() failed\n");
 		log_pt_error();
@@ -119,7 +128,7 @@ int main(int argc, char **argv)
 #else
 	for (;;) {
 		os_sleep();
-		main_loop();
+		if (main_loop()) break;
 	}
 #endif
 

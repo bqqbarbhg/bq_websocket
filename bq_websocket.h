@@ -481,6 +481,10 @@ const char *bqws_error_str(bqws_error error);
 const char *bqws_msg_type_str(bqws_msg_type type);
 const char *bqws_state_str(bqws_state state);
 
+void *bqws_allocator_alloc(const bqws_allocator *at, size_t size);
+void *bqws_allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_size, size_t new_size);
+void bqws_allocator_free(const bqws_allocator *at, void *ptr, size_t size);
+
 #ifdef __cplusplus
 }
 #endif

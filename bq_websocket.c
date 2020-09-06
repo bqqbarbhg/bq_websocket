@@ -614,11 +614,7 @@ static size_t mem_stream_recv(void *user, bqws_socket *ws, void *data, size_t ma
 // avaialable (which there should almost always be). These functions just call the
 // user callbacks or defaults passing in the user pointer.
 
-static void *allocator_alloc(const bqws_allocator *at, size_t size);
-static void *allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_size, size_t new_size);
-static void allocator_free(const bqws_allocator *at, void *ptr, size_t size);
-
-static void *allocator_alloc(const bqws_allocator *at, size_t size)
+void *bqws_allocator_alloc(const bqws_allocator *at, size_t size)
 {
 	if (at->alloc_fn) {
 		// User defined alloc directly
@@ -632,14 +628,14 @@ static void *allocator_alloc(const bqws_allocator *at, size_t size)
 	}
 }
 
-static void *allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_size, size_t new_size)
+void *bqws_allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_size, size_t new_size)
 {
 	if (old_size == 0) {
 		// Realloc with `old_size==0` is equivalent to malloc
-		return allocator_alloc(at, new_size);
+		return bqws_allocator_alloc(at, new_size);
 	} else if (new_size == 0) {
 		// Realloc with `new_size==0` is equivalent to free
-		allocator_free(at, ptr, old_size);
+		bqws_allocator_free(at, ptr, old_size);
 		return NULL;
 	}
 
@@ -662,7 +658,7 @@ static void *allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_s
 	}
 }
 
-static void allocator_free(const bqws_allocator *at, void *ptr, size_t size)
+void bqws_allocator_free(const bqws_allocator *at, void *ptr, size_t size)
 {
 	if (size == 0) return;
 	bqws_assert(ptr != NULL);
@@ -717,7 +713,7 @@ static void *ws_alloc(bqws_socket *ws, size_t size)
 {
 	if (!ws_add_memory_used(ws, size)) return NULL;
 
-	void *ptr = allocator_alloc(&ws->allocator, size);
+	void *ptr = bqws_allocator_alloc(&ws->allocator, size);
 	if (!ptr) ws_fail(ws, BQWS_ERR_ALLOCATOR);
 
 	return ptr;
@@ -728,7 +724,7 @@ static void *ws_realloc(bqws_socket *ws, void *ptr, size_t old_size, size_t new_
 	if (!ws_add_memory_used(ws, new_size)) return NULL;
 	ws_remove_memory_used(ws, old_size);
 
-	void *new_ptr = allocator_realloc(&ws->allocator, ptr, old_size, new_size);
+	void *new_ptr = bqws_allocator_realloc(&ws->allocator, ptr, old_size, new_size);
 	if (!new_ptr) ws_fail(ws, BQWS_ERR_ALLOCATOR);
 
 	return new_ptr;
@@ -737,7 +733,7 @@ static void *ws_realloc(bqws_socket *ws, void *ptr, size_t old_size, size_t new_
 static void ws_free(bqws_socket *ws, void *ptr, size_t size)
 {
 	ws_remove_memory_used(ws, size);
-	allocator_free(&ws->allocator, ptr, size);
+	bqws_allocator_free(&ws->allocator, ptr, size);
 }
 
 static char *ws_copy_str(bqws_socket *ws, const char *str)
@@ -823,11 +819,12 @@ static void msg_free_owned(bqws_socket *ws, bqws_msg_imp *msg)
 
 	size_t size = msg_alloc_size(&msg->msg);
 
+	// no-mutex(state): We are only referring to the address of `error_msg_data`
 	if ((char*)msg != ws->state.error_msg_data) {
 		ws_remove_memory_used(ws, size);
 
 		bqws_allocator at = msg->allocator;
-		allocator_free(&at, msg, size);
+		bqws_allocator_free(&at, msg, size);
 	}
 }
 
@@ -1365,17 +1362,17 @@ static bool hs_parse_server_handshake(bqws_socket *ws)
 			// Protocol that the server chose
 
 			// Keep the first one if there's duplicates
+			bqws_mutex_lock(&ws->state.mutex);
 			if (!ws->state.chosen_protocol) {
 				char *copy = ws_copy_str(ws, header.value);
 
-				bqws_mutex_lock(&ws->state.mutex);
 				if (!ws->state.chosen_protocol) {
 					ws->state.chosen_protocol = copy;
 				} else {
 					ws_free_str(ws, copy);
 				}
-				bqws_mutex_unlock(&ws->state.mutex);
 			}
+			bqws_mutex_unlock(&ws->state.mutex);
 		}
 	}
 
@@ -1384,17 +1381,17 @@ static bool hs_parse_server_handshake(bqws_socket *ws)
 	ws->io.handshake.read_offset = pos;
 
 	// If the server didn't choose any protocol set it as ""
+	bqws_mutex_lock(&ws->state.mutex);
 	if (!ws->state.chosen_protocol) {
 		char *copy = ws_copy_str(ws, "");
 
-		bqws_mutex_lock(&ws->state.mutex);
 		if (!ws->state.chosen_protocol) {
 			ws->state.chosen_protocol = copy;
 		} else {
 			ws_free_str(ws, copy);
 		}
-		bqws_mutex_unlock(&ws->state.mutex);
 	}
+	bqws_mutex_unlock(&ws->state.mutex);
 
 	return true;
 }
@@ -1707,7 +1704,9 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 
 		// Read from the handshake until we reach the end
 		while (!ws->err && ws->io.handshake_overflow.read_offset < ws->io.handshake_overflow.size) {
-			ws_read_data(ws, &ws_recv_from_handshake_overflow, NULL);
+			if (!ws_read_data(ws, &ws_recv_from_handshake_overflow, NULL)) {
+				return false;
+			}
 		}
 
 		if (ws->err) return false;
@@ -2368,7 +2367,7 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 		opts = &null_opts;
 	}
 
-	bqws_socket *ws = (bqws_socket*)allocator_alloc(&opts->allocator, sizeof(bqws_socket) + opts->user_size);
+	bqws_socket *ws = (bqws_socket*)bqws_allocator_alloc(&opts->allocator, sizeof(bqws_socket) + opts->user_size);
 	if (!ws) return NULL;
 
 	memset(ws, 0, sizeof(bqws_socket));
@@ -2649,14 +2648,15 @@ void bqws_free_socket(bqws_socket *ws)
 	ws->magic = BQWS_DELETED_MAGIC;
 
 	bqws_allocator at = ws->allocator;
-	allocator_free(&at, ws, sizeof(bqws_socket) + ws->user_size);
+	bqws_allocator_free(&at, ws, sizeof(bqws_socket) + ws->user_size);
 }
 
 bqws_client_opts *bqws_server_get_client_opts(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	bqws_assert(ws->is_server);
-	bqws_assert(ws->state.state == BQWS_STATE_CONNECTING);
+	// no-mutex(state): There's an inherent race condition with multiple accepts
+	bqws_assert(ws->state.state == BQWS_STATE_CONNECTING); 
 
 	bqws_mutex_lock(&ws->io.mutex);
 	bqws_client_opts *opts = ws->io.opts_from_client;
@@ -2669,6 +2669,7 @@ void bqws_server_accept(bqws_socket *ws, const char *protocol)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 	bqws_assert(ws->is_server);
+	// no-mutex(state): There's an inherent race condition with multiple accepts
 	bqws_assert(ws->state.state == BQWS_STATE_CONNECTING);
 	if (ws->err) return;
 
@@ -2693,9 +2694,8 @@ void bqws_server_reject(bqws_socket *ws)
 bqws_state bqws_get_state(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	// No mutex! We can always underestimate the state
-	bqws_state state = ws->state.state;
-	bqws_state override_state = ws->state.override_state;
+	// no-mutex(state): We can always underestimate the state
+	bqws_state state = ws->state.state, override_state = ws->state.override_state;
 	if (override_state > state) state = override_state;
 	return state;
 }
@@ -2709,9 +2709,8 @@ bqws_error bqws_get_error(const bqws_socket *ws)
 bool bqws_is_connecting(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	// No mutex! We can always underestimate the state
-	bqws_state state = ws->state.state;
-	bqws_state override_state = ws->state.override_state;
+	// no-mutex(state): We can always underestimate the state
+	bqws_state state = ws->state.state, override_state = ws->state.override_state;
 	if (override_state > state) state = override_state;
 	return state == BQWS_STATE_CONNECTING;
 }
@@ -2719,9 +2718,8 @@ bool bqws_is_connecting(const bqws_socket *ws)
 bool bqws_is_closed(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	// No mutex! We can always underestimate the state
-	bqws_state state = ws->state.state;
-	bqws_state override_state = ws->state.override_state;
+	// no-mutex(state): We can always underestimate the state
+	bqws_state state = ws->state.state, override_state = ws->state.override_state;
 	if (override_state > state) state = override_state;
 	return state == BQWS_STATE_CLOSED;
 }
@@ -2729,7 +2727,7 @@ bool bqws_is_closed(const bqws_socket *ws)
 size_t bqws_get_memory_used(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	// No mutex! This doesn't need to be accurate
+	// no-mutex(alloc): This doesn't need to be accurate
 	return ws->alloc.memory_used;
 }
 
@@ -2778,6 +2776,7 @@ bool bqws_get_io_closed(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 
+	// no-mutex(state): This can be inaccurate
 	return ws->state.io_closed;
 }
 
@@ -2823,7 +2822,7 @@ const char *bqws_get_protocol(const bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 
-	// TODO: Cache this pointer outside of IO mutex
+	// TODO: Cache this pointer outside of the state mutex
 	bqws_mutex_lock((bqws_mutex*)&ws->state.mutex);
 	const char *protocol = ws->state.chosen_protocol;
 	bqws_mutex_unlock((bqws_mutex*)&ws->state.mutex);
@@ -2858,7 +2857,7 @@ void bqws_free_msg(bqws_msg *msg)
 	imp->magic = BQWS_DELETED_MAGIC;
 
 	bqws_allocator at = imp->allocator;
-	allocator_free(&at, imp, msg_alloc_size(msg));
+	bqws_allocator_free(&at, imp, msg_alloc_size(msg));
 }
 
 void bqws_send(bqws_socket *ws, bqws_msg_type type, const void *data, size_t size)

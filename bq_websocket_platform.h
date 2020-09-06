@@ -100,6 +100,9 @@ typedef struct bqws_pt_listen_opts {
 	// Attempt to share a port with other processes ie. `SO_REUSEPORT`
 	bool reuse_port;
 
+	// Allocator callbacks
+	bqws_allocator allocator;
+
 } bqws_pt_listen_opts;
 
 // -- Global initialization
@@ -135,6 +138,8 @@ bqws_pt_address bqws_pt_get_address(const bqws_socket *ws);
 void bqws_pt_format_address(char *dst, size_t size, const bqws_pt_address *addr);
 
 void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err);
+
+void bqws_pt_sleep_ms(uint32_t ms);
 
 const char *bqws_pt_error_type_str(bqws_pt_error_type type);
 const char *bqws_pt_error_code_str(bqws_pt_error_code err);

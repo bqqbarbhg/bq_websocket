@@ -55,6 +55,10 @@ void main_loop()
         bqws_free_msg(msg);
     }
 
+    #if !defined(__EMSCRIPTEN_PTHREADS__)
+        bqws_update(ws);
+    #endif
+
     if (counter >= 10) {
         bqws_close(ws, BQWS_CLOSE_NORMAL, NULL, 0);
     }
