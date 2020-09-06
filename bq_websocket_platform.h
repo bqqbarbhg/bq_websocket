@@ -100,6 +100,9 @@ typedef struct bqws_pt_listen_opts {
 	// Attempt to share a port with other processes ie. `SO_REUSEPORT`
 	bool reuse_port;
 
+	// Allocator callbacks
+	bqws_allocator allocator;
+
 } bqws_pt_listen_opts;
 
 // -- Global initialization

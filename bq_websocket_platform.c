@@ -27,18 +27,6 @@ static __thread bqws_pt_error t_err;
 #define bqws_assert(x) assert(x)
 #endif
 
-#ifndef bqws_malloc
-#define bqws_malloc(size) malloc((size))
-#endif
-
-#ifndef bqws_realloc
-#define bqws_realloc(ptr, size) realloc((ptr), (size))
-#endif
-
-#ifndef bqws_free
-#define bqws_free(ptr) free((ptr))
-#endif
-
 static void pt_fail_pt(const char *func, bqws_pt_error_code code)
 {
 	t_err.function = func;
@@ -83,7 +71,10 @@ typedef struct {
 
 	// Packed zero separated url + protocols
 	size_t num_protocols;
+	size_t connect_data_size;
 	char *connect_data; 
+
+	bqws_allocator allocator;
 
 } pt_em_socket;
 
@@ -91,7 +82,9 @@ static void pt_em_free(pt_em_socket *em)
 {
 	bqws_assert(em->magic == BQWS_PT_EM_MAGIC);
 	em->magic = BQWS_PT_DELETED_MAGIC;
-	bqws_free(em);
+
+	bqws_allocator allocator = em->allocator;
+	bqws_allocator_free(&allocator, em, sizeof(pt_em_socket));
 }
 
 static bool pt_em_try_lock(pt_em_socket *em)
@@ -329,7 +322,7 @@ static bool pt_send_message(void *user, bqws_socket *ws, bqws_msg *msg)
 
 	if (type & BQWS_MSG_PARTIAL_BIT) {
 
-		pt_em_partial *part = bqws_malloc(sizeof(pt_em_partial) + size);
+		pt_em_partial *part = bqws_allocator_alloc(&em->allocator, sizeof(pt_em_partial) + size);
 		part->next = NULL;
 		part->size = size;
 		memcpy(part->data, data, size);
@@ -344,7 +337,7 @@ static bool pt_send_message(void *user, bqws_socket *ws, bqws_msg *msg)
 		}
 
 		if (type & BQWS_MSG_FINAL_BIT) {
-			char *ptr = (char*)bqws_malloc(em->partial_size);
+			char *ptr = (char*)bqws_allocator_alloc(&em->allocator, em->partial_size);
 
 			partial_buf = ptr;
 			data = ptr;
@@ -359,7 +352,7 @@ static bool pt_send_message(void *user, bqws_socket *ws, bqws_msg *msg)
 				memcpy(ptr, part->data, part->size);
 				ptr += part->size;
 
-				bqws_free(part);
+				bqws_allocator_free(&em->allocator, part, sizeof(pt_em_partial) + part->size);
 			}
 
 		} else {
@@ -386,7 +379,7 @@ static bool pt_send_message(void *user, bqws_socket *ws, bqws_msg *msg)
 	}
 
 	if (partial_buf) {
-		bqws_free(partial_buf);
+		bqws_allocator_free(&em->allocator, partial_buf, size);
 		if (ret) {
 			em->partial_first = NULL;
 			em->partial_last = NULL;
@@ -419,6 +412,9 @@ static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t s
 static void pt_io_init(void *user, bqws_socket *ws)
 {
 	pt_em_socket *em = (pt_em_socket*)user;
+
+	if (!pt_em_try_lock(em)) return;
+
 	const char *protocols[BQWS_MAX_PROTOCOLS];
 	const char *url_str = em->connect_data;
 
@@ -431,8 +427,10 @@ static void pt_io_init(void *user, bqws_socket *ws)
 	int handle = pt_em_connect_websocket(em, url_str, protocols, em->num_protocols);
 	em->handle = handle;
 
-	bqws_free(em->connect_data);
+	bqws_allocator_free(&em->allocator, em->connect_data, em->connect_data_size);
 	em->connect_data = NULL;
+
+	pt_em_unlock(em);
 }
 
 static void pt_io_close(void *user, bqws_socket *ws)
@@ -445,11 +443,11 @@ static void pt_io_close(void *user, bqws_socket *ws)
 	while (next) {
 		pt_em_partial *part = next;
 		next = part->next;
-		bqws_free(part);
+		bqws_allocator_free(&em->allocator, part, sizeof(pt_em_partial) + part->size);
 	}
 
 	if (em->connect_data) {
-		bqws_free(em->connect_data);
+		bqws_allocator_free(&em->allocator, em->connect_data, em->connect_data_size);
 	}
 
 	bool do_free = false;
@@ -493,9 +491,10 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 	opt.ping_response_timeout = SIZE_MAX;
 	opt.close_timeout = SIZE_MAX;
 
-	pt_em_socket *em = bqws_malloc(sizeof(pt_em_socket));
+	pt_em_socket *em = bqws_allocator_alloc(&opts->allocator, sizeof(pt_em_socket));
 	memset(em, 0, sizeof(pt_em_socket));
 	em->magic = BQWS_PT_EM_MAGIC;
+	em->allocator = opts->allocator;
 
 	opt.send_message_fn = &pt_send_message;
 	opt.send_message_user = em;
@@ -507,7 +506,7 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 
 	bqws_socket *ws = bqws_new_client(&opt, &copt);
 	if (!ws) {
-		bqws_free(em);
+		bqws_allocator_free(&opts->allocator, em, sizeof(pt_em_socket));
 		return NULL;
 	}
 
@@ -521,7 +520,7 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 		protocol_size[i] = strlen(copt.protocols[i]) + 1;
 		connect_data_size += protocol_size[i];
 	}
-	em->connect_data = (char*)bqws_malloc(connect_data_size);
+	em->connect_data = (char*)bqws_allocator_alloc(&em->allocator, connect_data_size);
 	em->num_protocols = copt.num_protocols;
 	{
 		char *ptr = em->connect_data;
@@ -1305,7 +1304,6 @@ static void cf_free(pt_cf *cf)
 {
     if (cf->read) CFRelease(cf->read);
     if (cf->write) CFRelease(cf->write);
-    bqws_free(cf);
 }
 
 static size_t cf_send(pt_cf *cf, const void *data, size_t size)
@@ -1446,6 +1444,7 @@ typedef struct {
     pt_cf cf;
 
 	bqws_pt_address address;
+	bqws_allocator allocator;
 } pt_io;
 
 struct bqws_pt_server {
@@ -1454,6 +1453,8 @@ struct bqws_pt_server {
 	os_socket s;
 	bool secure;
 	pt_tls_server tls;
+
+	bqws_allocator allocator;
 };
 
 static size_t io_imp_send(pt_io *io, const void *data, size_t size)
@@ -1501,7 +1502,9 @@ static void io_free(pt_io *io)
 	if (io->secure) tls_free(&io->tls);
     if (io->s != OS_BAD_SOCKET) os_socket_close(io->s);
 	io->magic = BQWS_PT_DELETED_MAGIC;
-	bqws_free(io);
+
+	bqws_allocator allocator = io->allocator;
+	bqws_allocator_free(&allocator, io, sizeof(pt_io));
 }
 
 static size_t pt_io_send(void *user, bqws_socket *ws, const void *data, size_t size)
@@ -1581,10 +1584,11 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 	pt_io *io = NULL;
 
 	do {
-        io = bqws_malloc(sizeof(pt_io));
+        io = bqws_allocator_alloc(&opts->allocator, sizeof(pt_io));
         if (!io) break;
-        
+
         memset(io, 0, sizeof(pt_io));
+		io->allocator = opts->allocator;
         io->s = OS_BAD_SOCKET;
 
         if (!cf_connect(url, &io->cf)) {
@@ -1627,22 +1631,23 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 
 static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *pt_opts)
 {
-	bqws_pt_server *sv = (bqws_pt_server*)bqws_malloc(sizeof(bqws_pt_server));
+	bqws_pt_server *sv = (bqws_pt_server*)bqws_allocator_alloc(&pt_opts->allocator, sizeof(bqws_pt_server));
 	if (!sv) { pt_fail_pt("pt_listen()", BQWS_PT_ERR_OUT_OF_MEMORY); return NULL; }
 	memset(sv, 0, sizeof(bqws_pt_server));
 	sv->magic = BQWS_PT_SERVER_MAGIC;
+	sv->allocator = pt_opts->allocator;
 
 	if (pt_opts->secure) {
 		sv->secure = true;
 		if (!tls_init_server(&sv->tls, pt_opts)) {
-			bqws_free(sv);
+			bqws_allocator_free(&pt_opts->allocator, sv, sizeof(bqws_pt_server));
 			return NULL;
 		}
 	}
 
 	sv->s = os_socket_listen(pt_opts);
 	if (sv->s == OS_BAD_SOCKET) {
-		bqws_free(sv);
+		bqws_allocator_free(&pt_opts->allocator, sv, sizeof(bqws_pt_server));
 		return NULL;
 	}
 
@@ -1660,12 +1665,14 @@ static bqws_socket *pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const b
 	pt_io *io = NULL;
 
 	do {
-		io = bqws_malloc(sizeof(pt_io));
+		io = bqws_allocator_alloc(&opts->allocator, sizeof(pt_io));
 		if (!io) break;
 
 		memset(io, 0, sizeof(pt_io));
 		io->magic = BQWS_PT_IO_MAGIC;
 		io->s = s;
+		io->allocator = opts->allocator;
+
 		io->address = addr;
         s = OS_BAD_SOCKET;
 
@@ -1708,7 +1715,9 @@ static void pt_free_server(bqws_pt_server *sv)
 	}
 	os_socket_close(sv->s);
 	sv->magic = BQWS_PT_DELETED_MAGIC;
-	bqws_free(sv);
+
+	bqws_allocator allocator = sv->allocator;
+	bqws_allocator_free(&allocator, sv, sizeof(bqws_pt_server));
 }
 
 static bqws_pt_address pt_get_address(const bqws_socket *ws)
