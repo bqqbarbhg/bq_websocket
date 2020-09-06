@@ -115,8 +115,8 @@ with open(src_path) as f:
                 fail("Accessing {} at line {} outside of a mutex:\n{}".format(mutex, lineno, line))
 
 if entered_mutexes:
-    unclosed = ", ".join(f"{name} (line {em.lineno})" for name, em in entered_mutexes.items())
-    fail(f"File ended with unclosed mutexes: {unclosed}")
+    unclosed = ", ".join("{} (line {})".format(name, em.lineno) for name, em in entered_mutexes.items())
+    fail("File ended with unclosed mutexes: {}".format(unclosed))
 
 num_protected = num_accesses - num_ignored
 print("SUCCESS: {} mutex sections protecting {} accesses! {} explicit 'no-mutex' accesses.".format(num_sections, num_protected, num_ignored))
