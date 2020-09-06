@@ -3,6 +3,8 @@ sudo: false
 language: cpp
 compiler: clang
 
+python: "3.8"
+
 script:
     - python3 misc/verify_mutexes.py
     - mkdir -p build
