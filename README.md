@@ -1,4 +1,4 @@
- # bq_websocket [![Build Status](https://travis-ci.org/bqqbarbhg/bq_websocket.svg?branch=master)](https://travis-ci.org/bqqbarbhg/bq_websocket) [![codecov](https://codecov.io/gh/bqqbarbhg/bq_websocket/branch/master/graph/badge.svg)](https://codecov.io/gh/bqqbarbhg/bq_websocket)
+ # bq_websocket [![CI](https://github.com/bqqbarbhg/bq_websocket/workflows/CI/badge.svg)](https://github.com/bqqbarbhg/bq_websocket/actions)
 
 
 Single source file WebSocket library.
