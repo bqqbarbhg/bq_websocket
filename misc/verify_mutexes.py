@@ -64,7 +64,7 @@ with open(src_path) as f:
             if mutex not in mutex_names: continue
             em = entered_mutexes.get(mutex)
             if em:
-                fail(f"Potential deadlock of {mutex}: Entered at lines {em.lineno} and {lineno}")
+                fail("Potential deadlock of {}: Entered at lines {} and {}".format(mutex, em.lineno, lineno))
             entered_mutexes[mutex] = EnteredMutex(indent, lineno, False)
             num_sections += 1
             continue
@@ -75,9 +75,9 @@ with open(src_path) as f:
             if mutex not in mutex_names: continue
             em = entered_mutexes.get(mutex)
             if not em:
-                fail(f"Exiting non-entered mutex {mutex} at line {lineno}")
+                fail("Exiting non-entered mutex {} at line {}".format(mutex, lineno))
             if em.asserted:
-                fail(f"Unlocking an asserted mutex at line {lineno}")
+                fail("Unlocking an asserted mutex at line {}".format(lineno))
             if em.indent == indent:
                 del entered_mutexes[mutex]
             continue
@@ -87,10 +87,10 @@ with open(src_path) as f:
             mutex = m.group(1)
             if mutex not in mutex_names: continue
             if indent != 1:
-                fail(f"bqws_assert_locked() not at top-level on line {lineno}")
+                fail("bqws_assert_locked() not at top-level on line {}".format(lineno))
             em = entered_mutexes.get(mutex)
             if em:
-                fail(f"Potential deadlock of {mutex}: Entered at lines {em.lineno} and {lineno}")
+                fail("Potential deadlock of {}: Entered at lines {} and {}".format(mutex, em.lineno, lineno))
             entered_mutexes[mutex] = EnteredMutex(indent, lineno, True)
             continue
 
@@ -112,10 +112,11 @@ with open(src_path) as f:
                 num_ignored += 1
                 continue
             if mutex not in entered_mutexes:
-                fail(f"Accessing {mutex} at line {lineno} outside of a mutex:\n{line}")
+                fail("Accessing {} at line {} outside of a mutex:\n{}".format(mutex, lineno, line))
 
 if entered_mutexes:
     unclosed = ", ".join(f"{name} (line {em.lineno})" for name, em in entered_mutexes.items())
     fail(f"File ended with unclosed mutexes: {unclosed}")
 
-print(f"SUCCESS: {num_sections} mutex sections protecting {num_accesses - num_ignored} accesses! {num_ignored} explicit 'no-mutex' accesses.")
+num_protected = num_accesses - num_ignored
+print("SUCCESS: {} mutex sections protecting {} accesses! {} explicit 'no-mutex' accesses.".format(num_sections, num_protected, num_ignored))
