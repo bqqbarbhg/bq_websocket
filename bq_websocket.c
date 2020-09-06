@@ -738,7 +738,7 @@ static void ws_free(bqws_socket *ws, void *ptr, size_t size)
 static char *ws_copy_str(bqws_socket *ws, const char *str)
 {
 	size_t len = strlen(str) + 1;
-	char *dst = ws_alloc(ws, len);
+	char *dst = (char*)ws_alloc(ws, len);
 	if (!dst) return NULL;
 	memcpy(dst, str, len);
 	return dst;
@@ -760,7 +760,7 @@ static bqws_msg_imp *msg_alloc(bqws_socket *ws, bqws_msg_type type, size_t size)
 	if (type & BQWS_MSG_TEXT) capacity += 1;
 
 	size_t alloc_size = sizeof(bqws_msg_imp) + capacity;
-	bqws_msg_imp *msg = ws_alloc(ws, alloc_size);
+	bqws_msg_imp *msg = (bqws_msg_imp*)ws_alloc(ws, alloc_size);
 	if (!msg) return NULL;
 
 	msg->magic = BQWS_MSG_MAGIC;
@@ -1000,7 +1000,7 @@ static void hs_push_size(bqws_socket *ws, const char *data, size_t size)
 			return;
 		}
 
-		char *new_data = ws_realloc(ws, ws->io.handshake.data, ws->io.handshake.capacity, new_cap);
+		char *new_data = (char*)ws_realloc(ws, ws->io.handshake.data, ws->io.handshake.capacity, new_cap);
 		if (!new_data) return;
 		ws->io.handshake.data = new_data;
 		ws->io.handshake.capacity = new_cap;
@@ -1023,11 +1023,6 @@ static void hs_push2(bqws_socket *ws, const char *a, const char *b)
 static void hs_push3(bqws_socket *ws, const char *a, const char *b, const char *c)
 {
 	hs_push(ws, a); hs_push(ws, b); hs_push(ws, c);
-}
-
-static void hs_push4(bqws_socket *ws, const char *a, const char *b, const char *c, const char *d)
-{
-	hs_push(ws, a); hs_push(ws, b); hs_push(ws, c); hs_push(ws, c);
 }
 
 static const char *base64_tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1234,7 +1229,7 @@ static bool hs_parse_client_handshake(bqws_socket *ws)
 
 	size_t pos = 0;
 
-	bqws_client_opts *opts = ws_alloc(ws, sizeof(bqws_client_opts));
+	bqws_client_opts *opts = (bqws_client_opts*)ws_alloc(ws, sizeof(bqws_client_opts));
 	if (!opts) return false;
 	memset(opts, 0, sizeof(bqws_client_opts));
 	ws->io.opts_from_client = opts;
@@ -1426,7 +1421,7 @@ static void hs_store_handshake_overflow(bqws_socket *ws)
 	size_t left = ws->io.handshake.size - offset;
 	if (left == 0) return;
 
-	ws->io.handshake_overflow.data = ws_alloc(ws, left);
+	ws->io.handshake_overflow.data = (char*)ws_alloc(ws, left);
 	if (!ws->io.handshake_overflow.data) return;
 	memcpy(ws->io.handshake_overflow.data, ws->io.handshake.data + offset, left);
 	ws->io.handshake_overflow.capacity = left;
@@ -1593,7 +1588,7 @@ static bool ws_read_handshake(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *us
 				return false;
 			}
 
-			char *data = ws_realloc(ws, ws->io.handshake.data,	 ws->io.handshake.capacity, new_cap);
+			char *data = (char*)ws_realloc(ws, ws->io.handshake.data, ws->io.handshake.capacity, new_cap);
 			if (!data) return false;
 			ws->io.handshake.data = data;
 			ws->io.handshake.capacity = new_cap;
@@ -1617,7 +1612,7 @@ static bool ws_read_handshake(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *us
 		if (begin < 0) begin = 0;
 		char *ptr = ws->io.handshake.data + begin;
 		char *end = ws->io.handshake.data + ws->io.handshake.size;
-		while ((ptr = memchr(ptr, '\r', end - ptr)) != NULL) {
+		while ((ptr = (char*)memchr(ptr, '\r', end - ptr)) != NULL) {
 			if (end - ptr >= 4 && !memcmp(ptr, "\r\n\r\n", 4)) {
 				return true;
 			} else {
@@ -1845,9 +1840,9 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 				return false;
 			}
 
-			type = buf->partial_type | BQWS_MSG_PARTIAL_BIT;
+			type = (bqws_msg_type)(buf->partial_type | BQWS_MSG_PARTIAL_BIT);
 			if (fin) {
-				type |= BQWS_MSG_FINAL_BIT;
+				type = (bqws_msg_type)(type | BQWS_MSG_FINAL_BIT);
 				buf->partial_type = BQWS_MSG_INVALID;
 			}
 
@@ -1863,7 +1858,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 				}
 
 				buf->partial_type = type;
-				type |= BQWS_MSG_PARTIAL_BIT;
+				type = (bqws_msg_type)(type | BQWS_MSG_PARTIAL_BIT);
 			}
 		} else if (opcode >= 0x8 && opcode <= 0xa) {
 			// Control frames
@@ -1967,7 +1962,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 			// If this is the final message concatenate all the partial messages
 			// in the queue and enqueue the final one>
 
-			bqws_msg_type base_type = msg->msg.type & BQWS_MSG_TYPE_MASK;
+			bqws_msg_type base_type = (bqws_msg_type)(msg->msg.type & BQWS_MSG_TYPE_MASK);
 			bqws_msg_imp *combined = msg_alloc(ws, base_type, ws->io.recv_partial_size);
 			if (!combined) return false;
 
@@ -2160,7 +2155,7 @@ static bool ws_write_data(bqws_socket *ws, bqws_io_send_fn *send_fn, void *user)
 		uint32_t opcode = ~0u;
 
 		if (type & BQWS_MSG_TYPE_MASK) {
-			bqws_msg_type base_type = type & BQWS_MSG_TYPE_MASK;
+			bqws_msg_type base_type = (bqws_msg_type)(type & BQWS_MSG_TYPE_MASK);
 			opcode = base_type == BQWS_MSG_TEXT ? 0x1 : 0x2;
 
 			if (type & BQWS_MSG_PARTIAL_BIT) {
@@ -2506,7 +2501,7 @@ bqws_socket *bqws_new_server(const bqws_opts *opts, const bqws_server_opts *serv
 				text_size += strlen(filter->protocols[i]) + 1;
 			}
 
-			bqws_verify_filter *copy = ws_alloc(ws, sizeof(bqws_verify_filter) + text_size);
+			bqws_verify_filter *copy = (bqws_verify_filter*)ws_alloc(ws, sizeof(bqws_verify_filter) + text_size);
 			if (!copy) {
 				bqws_free_socket(ws);
 				return NULL;
@@ -2626,7 +2621,7 @@ void bqws_free_socket(bqws_socket *ws)
 
 	// Verify filter copy
 	if (ws->verify_fn == &bqws_internal_filter_verify) {
-		bqws_verify_filter *filter = ws->verify_user;
+		bqws_verify_filter *filter = (bqws_verify_filter*)ws->verify_user;
 		bqws_assert(filter->magic == BQWS_FILTER_MAGIC);
 		filter->magic = BQWS_DELETED_MAGIC;
 		ws_free(ws, filter, sizeof(bqws_verify_filter) + filter->text_size);
@@ -2944,7 +2939,7 @@ void bqws_send_append(bqws_socket *ws, const void *data, size_t size)
 		ws_enqueue_send(ws, ws->partial.next_partial_to_send);
 	}
 
-	bqws_msg_type partial_type = ws->partial.send_partial_type | BQWS_MSG_PARTIAL_BIT;
+	bqws_msg_type partial_type = (bqws_msg_type)(ws->partial.send_partial_type | BQWS_MSG_PARTIAL_BIT);
 	bqws_msg_imp *imp = msg_alloc(ws, partial_type, size);
 	if (imp) {
 		memcpy(imp->msg.data, data, size);
@@ -2954,7 +2949,7 @@ void bqws_send_append(bqws_socket *ws, const void *data, size_t size)
 	bqws_mutex_unlock(&ws->partial.mutex);
 }
 
-void bqws_send_append_str(bqws_socket *ws, const void *str)
+void bqws_send_append_str(bqws_socket *ws, const char *str)
 {
 	bqws_send_append(ws, str, strlen(str));
 }
@@ -2978,7 +2973,7 @@ void bqws_send_append_msg(bqws_socket *ws, bqws_msg *msg)
 	bqws_msg_imp *imp = msg_imp(msg);
 	if (!msg_acquire_ownership(ws, imp)) return;
 
-	msg->type = ws->partial.send_partial_type | BQWS_MSG_PARTIAL_BIT;
+	msg->type = (bqws_msg_type)(ws->partial.send_partial_type | BQWS_MSG_PARTIAL_BIT);
 	ws->partial.next_partial_to_send = imp;
 
 	bqws_mutex_unlock(&ws->partial.mutex);
@@ -2995,7 +2990,8 @@ void bqws_send_finish(bqws_socket *ws)
 
 	if (ws->partial.next_partial_to_send) {
 		bqws_assert(ws->partial.next_partial_to_send->magic == BQWS_MSG_MAGIC);
-		ws->partial.next_partial_to_send->msg.type |= BQWS_MSG_FINAL_BIT;
+		bqws_msg_type type = ws->partial.next_partial_to_send->msg.type;
+		ws->partial.next_partial_to_send->msg.type = (bqws_msg_type)(type | BQWS_MSG_FINAL_BIT);
 		ws_enqueue_send(ws, ws->partial.next_partial_to_send);
 		ws->partial.next_partial_to_send = NULL;
 	}

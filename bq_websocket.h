@@ -226,6 +226,10 @@ typedef struct bqws_limits {
 } bqws_limits;
 
 typedef struct bqws_opts {
+
+	// Name for the socket for debugging
+	const char *name;
+
 	bqws_io io;
 	bqws_allocator allocator;
 	bqws_limits limits;
@@ -281,9 +285,6 @@ typedef struct bqws_opts {
 	// the close timeout.
 	// default: 4 * ping_interval
 	size_t ping_response_timeout;
-
-	// Name for the socket for debugging
-	const char *name;
 
 	// If set returns `BQWS_MSG_PARTIAL_*` messages from `bqws_recv()`
 	bool recv_partial_messages;
@@ -439,7 +440,7 @@ void bqws_send_msg(bqws_socket *ws, bqws_msg *msg);
 // Streaming messages
 void bqws_send_begin(bqws_socket *ws, bqws_msg_type type);
 void bqws_send_append(bqws_socket *ws, const void *data, size_t size);
-void bqws_send_append_str(bqws_socket *ws, const void *str);
+void bqws_send_append_str(bqws_socket *ws, const char *str);
 void bqws_send_append_msg(bqws_socket *ws, bqws_msg *msg);
 void bqws_send_finish(bqws_socket *ws);
 

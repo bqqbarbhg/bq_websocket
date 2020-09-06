@@ -7,6 +7,7 @@ import sys
 import subprocess
 import shlex
 import re
+import shutil
 
 verbose = "-v" in sys.argv
 
@@ -59,7 +60,7 @@ def run_cmd(args):
 
 def extract_readme_examples():
     print("=== Extracting README examples ===")
-    RE_EXAMPLE = re.compile(r"\s*\[//\]:\s*#example\s+(\w+\.c)\s*")
+    RE_EXAMPLE = re.compile(r"\s*\[//\]:\s*# \(example\s+(\w+\.c)\s*\)\s*")
     with open("../README.md") as f:
         file_name = None
         lines = []
@@ -84,6 +85,14 @@ def extract_readme_examples():
                     lines.append(line)
 
 
+def copy_cpp_files():
+    print("=== Copying C++ variants ===")
+    shutil.copyfile("../bq_websocket.c", "bq_websocket.cpp")
+    shutil.copyfile("../bq_websocket_platform.c", "bq_websocket_platform.cpp")
+    shutil.copyfile("../bq_websocket.h", "bq_websocket.h")
+    shutil.copyfile("../bq_websocket_platform.h", "bq_websocket_platform.h")
+    shutil.copyfile("readme_client_usage.c", "readme_client_usage.cpp")
+
 def build_exe(exe):
     if not exe.sources: return
     print("=== Building {} ===".format(exe.name), flush=True)
@@ -103,12 +112,17 @@ def build_exe(exe):
         run_cmd(args)
     else:
         IGNORE_WARNINGS = ["-Wno-unused-value"]
-        CC_FLAGS = ["-g", "-std=gnu99", "-O2", "-DGNU_SOURCE"]
+        is_cpp = any(s.endswith(".cpp") for s in exe.sources)
+        CC_FLAGS = ["-g", "-O2", "-DGNU_SOURCE", "-Wall"]
         LD_FLAGS = ["-lpthread"]
         args = ["clang"]
         args += (src_path(s) for s in exe.sources)
         args += IGNORE_WARNINGS
         args += CC_FLAGS
+        if is_cpp:
+            args += ["-std=c++11"]
+        else:
+            args += ["-std=gnu99"]
         args += ("-D" + d for d in exe.defines)
         args += ["-I.."]
         args += LD_FLAGS
@@ -166,11 +180,16 @@ TEST_EXES = [
         name="readme_client_usage",
         sources=["bq_websocket.c", "bq_websocket_platform.c", "build/readme_client_usage.c"],
     ),
+    TestExe(
+        name="readme_client_usage",
+        desc="readme_client_usage (C++)",
+        sources=["build/bq_websocket.cpp", "build/bq_websocket_platform.cpp", "build/readme_client_usage.cpp"],
+    ),
 ]
 
 extract_tar_gz("../test/fuzz/fuzz_test_cases.tar.gz")
-
 extract_readme_examples()
+copy_cpp_files()
 
 if sys.platform == "win32":
     init_vsvars()
