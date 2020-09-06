@@ -4,7 +4,7 @@ language: cpp
 compiler: clang
 
 script:
-    - misc/verify_mutexes.py
+    - python3 misc/verify_mutexes.py
     - mkdir -p build
     - cd build
     - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -D_GNU_SOURCE ../bq_websocket.c ../test/test_self.c -o test_self_push
