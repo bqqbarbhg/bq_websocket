@@ -149,13 +149,15 @@ EMSCRIPTEN_KEEPALIVE int pt_em_is_closed(pt_em_socket *em)
 }
 
 EM_JS(int, pt_em_connect_websocket, (pt_em_socket *em, const char *url, const char **protocols, size_t num_protocols), {
+	var webSocket = typeof WebSocket !== "undefined" ? WebSocket : require("ws");
+
 	var url_str = UTF8ToString(url);
 	var protocols_str = [];
 	for (var i = 0; i < num_protocols; i++) {
 		var protocol = HEAPU32[(protocols >> 2) + i];
 		protocols_str.push(UTF8ToString(protocol));
 	}
-	var ws = new WebSocket(url_str, protocols_str);
+	var ws = new webSocket(url_str, protocols_str);
 
 	ws.binaryType = "arraybuffer";
 
@@ -346,7 +348,7 @@ static bool pt_send_message(void *user, bqws_socket *ws, bqws_msg *msg)
 			partial_buf = ptr;
 			data = ptr;
 			size = em->partial_size;
-			type = (type & BQWS_MSG_TYPE_MASK);
+			type = (bqws_msg_type)(type & BQWS_MSG_TYPE_MASK);
 
 			pt_em_partial *next = em->partial_first;
 			while (next) {
@@ -368,9 +370,9 @@ static bool pt_send_message(void *user, bqws_socket *ws, bqws_msg *msg)
 	bool ret = true;
 
 	if (type == BQWS_MSG_BINARY) {
-		ret = (bool)pt_em_websocket_send_binary(em->handle, em, data, size);
+		ret = (bool)pt_em_websocket_send_binary(em->handle, em, (const char *)data, size);
 	} else if (type == BQWS_MSG_TEXT) {
-		ret = (bool)pt_em_websocket_send_text(em->handle, em, data, size);
+		ret = (bool)pt_em_websocket_send_text(em->handle, em, (const char *)data, size);
 	} else if (type == BQWS_MSG_CONTROL_CLOSE) {
 		unsigned code = 1000;
 		if (msg->size >= 2) {
