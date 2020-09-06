@@ -52,7 +52,7 @@ int main()
 ## Integration
 
 All you need to do is to add bq_websocket.c/h (and optionally bq_websocket_platform.c/h) to your build.
-Alternatively you can include the implementation files as headers to supply defines to customize their behavior:
+Alternatively you can include the implementation files as (either C or C++) headers to supply defines to customize their behavior:
 
 ```cpp
 // Override the default/platform allocators, you don't need to do this at compile-time
