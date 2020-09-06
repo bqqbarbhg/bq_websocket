@@ -27,6 +27,7 @@ class TestExe:
         self.args = kwargs.get("args", [])
         self.sources = kwargs.get("sources", [])
         self.defines = kwargs.get("defines", [])
+        self.use_network = kwargs.get("use_network", False)
 
 def extract_tar_gz(name):
     print("Extracting {}".format(name), flush=True)
@@ -115,19 +116,26 @@ def build_exe(exe):
         is_cpp = any(s.endswith(".cpp") for s in exe.sources)
         CC_FLAGS = ["-g", "-O2", "-DGNU_SOURCE", "-Wall"]
         LD_FLAGS = ["-lpthread"]
-        args = ["clang"]
-        args += (src_path(s) for s in exe.sources)
-        args += IGNORE_WARNINGS
-        args += CC_FLAGS
-        if is_cpp:
-            args += ["-std=c++11"]
-        else:
-            args += ["-std=gnu99"]
-        args += ("-D" + d for d in exe.defines)
-        args += ["-I.."]
-        args += LD_FLAGS
-        args += ["-o", exe.name]
-        run_cmd(args)
+
+        ccs = ["gcc", "clang"]
+
+        for cc in ccs:
+            args = [cc]
+            args += (src_path(s) for s in exe.sources)
+            args += IGNORE_WARNINGS
+            args += CC_FLAGS
+            if is_cpp:
+                args += ["-std=c++11"]
+            else:
+                args += ["-std=gnu99"]
+            args += ("-D" + d for d in exe.defines)
+            args += ["-I.."]
+            args += LD_FLAGS
+            if sys.platform == "darwin" and exe.use_network:
+                args += ["-framework", "CoreFoundation"]
+                args += ["-framework", "CFNetwork"]
+            args += ["-o", exe.name]
+            run_cmd(args)
 
 def run_exe(exe):
     print("=== Running {} ===".format(exe.desc), flush=True)
@@ -175,15 +183,18 @@ TEST_EXES = [
         name="example_echo_client_pt",
         sources=["bq_websocket.c", "bq_websocket_platform.c", "examples/echo_client_pt.c"],
         defines=["NO_TLS"],
+        use_network=True,
     ),
     TestExe(
         name="readme_client_usage",
         sources=["bq_websocket.c", "bq_websocket_platform.c", "build/readme_client_usage.c"],
+        use_network=True,
     ),
     TestExe(
         name="readme_client_usage",
         desc="readme_client_usage (C++)",
         sources=["build/bq_websocket.cpp", "build/bq_websocket_platform.cpp", "build/readme_client_usage.cpp"],
+        use_network=True,
     ),
 ]
 
