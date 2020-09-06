@@ -60,7 +60,7 @@ def run_cmd(args):
 
 def extract_readme_examples():
     print("=== Extracting README examples ===")
-    RE_EXAMPLE = re.compile(r"\s*\[//\]:\s*#example\s+(\w+\.c)\s*")
+    RE_EXAMPLE = re.compile(r"\s*\[//\]:\s*# \(example\s+(\w+\.c)\s*\)\s*")
     with open("../README.md") as f:
         file_name = None
         lines = []

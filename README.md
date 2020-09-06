@@ -16,7 +16,7 @@ The library is dual licensed under **public domain** and **MIT**, you can choose
 
 ### Client (using bq_websocket_platform.h)
 
-[//]: #example readme_client_usage.c
+[//]: # (example readme_client_usage.c)
 ```c
 #include "bq_websocket.h"
 #include "bq_websocket_platform.h"
