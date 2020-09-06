@@ -1,6 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 
-#include "../bq_websocket.h"
+#include "../../bq_websocket.h"
 
 #include <stdio.h>
 #include <stdlib.h>
