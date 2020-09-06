@@ -11,7 +11,12 @@ verbose = "-v" in sys.argv
 
 self_path = os.path.dirname(os.path.abspath(__file__))
 root_path = os.path.join(self_path, "..")
-os.chdir(os.path.join(root_path, "build"))
+build_path = os.path.join(root_path, "build")
+
+if not os.path.exists(build_path):
+    print("Creating build directory: {}".format(os.path.abspath(build_path)))
+    os.mkdir(build_path)
+os.chdir(build_path)
 
 class TestExe:
     def __init__(self, **kwargs):
