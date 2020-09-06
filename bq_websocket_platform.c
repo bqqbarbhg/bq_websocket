@@ -50,6 +50,21 @@ static void pt_fail_pt(const char *func, bqws_pt_error_code code)
 
 #include <emscripten.h>
 
+#if defined(__EMSCRIPTEN_PTHREADS__)
+	#include <pthread.h>
+	typedef pthread_mutex_t pt_em_mutex;
+	#define pt_em_mutex_init(m) pthread_mutex_init((m), NULL)
+	#define pt_em_mutex_free(m) pthread_mutex_destroy((m))
+	#define pt_em_mutex_lock(m) pthread_mutex_lock((m))
+	#define pt_em_mutex_unlock(m) pthread_mutex_unlock((m))
+#else
+	typedef int pt_em_mutex;
+	#define pt_em_mutex_init(m) (void)0
+	#define pt_em_mutex_free(m) (void)0
+	#define pt_em_mutex_lock(m) (void)0
+	#define pt_em_mutex_unlock(m) (void)0
+#endif
+
 typedef struct pt_em_partial {
 	struct pt_em_partial *next;
 	size_t size;
@@ -63,38 +78,80 @@ typedef struct {
 	pt_em_partial *partial_last;
 	size_t partial_size;
 
+	pt_em_mutex ws_mutex;
+	bqws_socket *ws;
+
 	// Packed zero separated url + protocols
 	size_t num_protocols;
 	char *connect_data; 
 
 } pt_em_socket;
 
-EMSCRIPTEN_KEEPALIVE void *pt_em_msg_alloc(bqws_socket *ws, size_t size, int type)
+static void pt_em_free(pt_em_socket *em)
 {
-	bqws_msg *msg = bqws_allocate_msg(ws, (bqws_msg_type)type, size);
+	bqws_assert(em->magic == BQWS_PT_EM_MAGIC);
+	em->magic = BQWS_PT_DELETED_MAGIC;
+	bqws_free(em);
+}
+
+static bool pt_em_try_lock(pt_em_socket *em)
+{
+	pt_em_mutex_lock(&em->ws_mutex);
+	if (!em->ws) {
+		// TODO: Free the em context here
+		pt_em_mutex_unlock(&em->ws_mutex);
+		pt_em_free(em);
+		return false;
+	}
+	return true;
+}
+
+static void pt_em_unlock(pt_em_socket *em)
+{
+	pt_em_mutex_unlock(&em->ws_mutex);
+}
+
+EMSCRIPTEN_KEEPALIVE void *pt_em_msg_alloc(pt_em_socket *em, size_t size, int type)
+{
+	if (!pt_em_try_lock(em)) return em; /* HACK: return the handle on close! */
+	bqws_msg *msg = bqws_allocate_msg(em->ws, (bqws_msg_type)type, size);
+	pt_em_unlock(em);
 	if (!msg) return NULL;
 	return msg->data;
 }
 
-EMSCRIPTEN_KEEPALIVE void pt_em_msg_recv(bqws_socket *ws, void *ptr)
+EMSCRIPTEN_KEEPALIVE int pt_em_msg_recv(pt_em_socket *em, void *ptr)
 {
+	if (!pt_em_try_lock(em)) return 1;
 	bqws_msg *msg = (bqws_msg*)((char*)ptr - offsetof(bqws_msg, data));
-	bqws_direct_push_msg(ws, msg);
+	bqws_direct_push_msg(em->ws, msg);
+	pt_em_unlock(em);
+	return 0;
 }
 
-EMSCRIPTEN_KEEPALIVE void pt_em_on_open(bqws_socket *ws)
+EMSCRIPTEN_KEEPALIVE int pt_em_on_open(pt_em_socket *em)
 {
-	bqws_direct_set_override_state(ws, BQWS_STATE_OPEN);
+	if (!pt_em_try_lock(em)) return 1;
+	bqws_direct_set_override_state(em->ws, BQWS_STATE_OPEN);
+	pt_em_unlock(em);
+	return 0;
 }
 
-EMSCRIPTEN_KEEPALIVE void pt_em_on_close(bqws_socket *ws)
+EMSCRIPTEN_KEEPALIVE int pt_em_on_close(pt_em_socket *em)
 {
-	pt_em_socket *em = (pt_em_socket*)bqws_get_io_user(ws);
-	bqws_direct_set_override_state(ws, BQWS_STATE_CLOSED);
+	if (!pt_em_try_lock(em)) return 1;
+	bqws_direct_set_override_state(em->ws, BQWS_STATE_CLOSED);
 	em->handle = -1;
+	pt_em_unlock(em);
+	return 0;
 }
 
-EM_JS(int, pt_em_connect_websocket, (bqws_socket *bqws, const char *url, const char **protocols, size_t num_protocols), {
+EMSCRIPTEN_KEEPALIVE int pt_em_is_closed(pt_em_socket *em)
+{
+	return em->ws == NULL;
+}
+
+EM_JS(int, pt_em_connect_websocket, (pt_em_socket *em, const char *url, const char **protocols, size_t num_protocols), {
 	var url_str = UTF8ToString(url);
 	var protocols_str = [];
 	for (var i = 0; i < num_protocols; i++) {
@@ -108,6 +165,7 @@ EM_JS(int, pt_em_connect_websocket, (bqws_socket *bqws, const char *url, const c
 	if (Module.g_bqws_pt_sockets === undefined) {
 		Module.g_bqws_pt_sockets = {
 			sockets: [null],
+			em_sockets: [null],
 			free_list: [],
 		};
 	}
@@ -116,55 +174,93 @@ EM_JS(int, pt_em_connect_websocket, (bqws_socket *bqws, const char *url, const c
 	if (Module.g_bqws_pt_sockets.free_list.length > 0) {
 		handle = Module.g_bqws_pt_sockets.free_list.pop();
 		Module.g_bqws_pt_sockets.sockets[handle] = ws;
+		Module.g_bqws_pt_sockets.em_sockets[handle] = em;
 	} else {
 		handle = Module.g_bqws_pt_sockets.sockets.length;
 		Module.g_bqws_pt_sockets.sockets.push(ws);
+		Module.g_bqws_pt_sockets.em_sockets.push(em);
 	}
+
+	var interval = setInterval(function() {
+		if (_pt_em_is_closed(em)) {
+			ws.close();
+		}
+	}, 1000);
 
 	ws.onopen = function(e) {
 		if (Module.g_bqws_pt_sockets.sockets[handle] !== ws) return;
 
-		_pt_em_on_open(bqws);
+		if (_pt_em_on_open(em)) {
+			ws.close();
+			Module.g_bqws_pt_sockets.sockets[handle] = null;
+			Module.g_bqws_pt_sockets.em_sockets[handle] = null;
+			Module.g_bqws_pt_sockets.free_list.push(handle);
+		}
 	};
 	ws.onclose = function(e) {
+		if (interval !== null) {
+			clearInterval(interval);
+			interval = null;
+		}
 		if (Module.g_bqws_pt_sockets.sockets[handle] !== ws) return;
 
-		_pt_em_on_close(bqws);
+		_pt_em_on_close(em);
 		Module.g_bqws_pt_sockets.sockets[handle] = null;
+		Module.g_bqws_pt_sockets.em_sockets[handle] = null;
 		Module.g_bqws_pt_sockets.free_list.push(handle);
 	};
 	ws.onerror = function(e) {
 		if (Module.g_bqws_pt_sockets.sockets[handle] !== ws) return;
 
-		_pt_em_on_close(bqws);
+		_pt_em_on_close(em);
+		ws.close();
 		Module.g_bqws_pt_sockets.sockets[handle] = null;
+		Module.g_bqws_pt_sockets.em_sockets[handle] = null;
 		Module.g_bqws_pt_sockets.free_list.push(handle);
 	};
 
 	ws.onmessage = function(e) {
 		if (Module.g_bqws_pt_sockets.sockets[handle] !== ws) return;
 
+		var deleted = 0;
 		if (typeof e.data === "string") {
 			var size = lengthBytesUTF8(e.data);
-			var ptr = _pt_em_msg_alloc(bqws, size, 1);
-			if (ptr != 0) {
+			var ptr = _pt_em_msg_alloc(em, size, 1);
+			if (ptr == em) {
+				// HACK: pt_em_msg_alloc() returns `em` if deleted
+				deleted = 1;
+			} else if (ptr != 0) {
 				stringToUTF8(e.data, ptr, size + 1);
-				_pt_em_msg_recv(bqws, ptr);
+				deleted = _pt_em_msg_recv(em, ptr);
 			}
 		} else {
 			var size = e.data.byteLength;
-			var ptr = _pt_em_msg_alloc(bqws, size, 2);
-			if (ptr != 0) {
+			var ptr = _pt_em_msg_alloc(em, size, 2);
+			if (ptr == em) {
+				// HACK: pt_em_msg_alloc() returns `em` if deleted
+				deleted = 1;
+			} else if (ptr != 0) {
 				HEAPU8.set(new Uint8Array(e.data), ptr);
-				_pt_em_msg_recv(bqws, ptr);
+				deleted = _pt_em_msg_recv(em, ptr);
 			}
+		}
+
+		if (deleted != 0) {
+			ws.close();
+			Module.g_bqws_pt_sockets.sockets[handle] = null;
+			Module.g_bqws_pt_sockets.em_sockets[handle] = null;
+			Module.g_bqws_pt_sockets.free_list.push(handle);
 		}
 	};
 
 	return handle;
 });
 
-EM_JS(int, pt_em_websocket_send_binary, (int handle, const char *data, size_t size), {
+EM_JS(int, pt_em_websocket_send_binary, (int handle, pt_em_socket *em, const char *data, size_t size), {
+	if (!Module.g_bqws_pt_sockets || em !== Module.g_bqws_pt_sockets.em_sockets[handle]) {
+		console.error("WebSocket '0x" + em.toString(16) + "' not found in thread: Make sure to call bqws_update() only from a single thread per socket in WASM!");
+		return 0;
+	}
 	var ws = Module.g_bqws_pt_sockets.sockets[handle];
 	if (ws.readyState == 0) {
 		return 0;
@@ -180,7 +276,11 @@ EM_JS(int, pt_em_websocket_send_binary, (int handle, const char *data, size_t si
 	return 1;
 });
 
-EM_JS(int, pt_em_websocket_send_text, (int handle, const char *data, size_t size), {
+EM_JS(int, pt_em_websocket_send_text, (int handle, pt_em_socket *em, const char *data, size_t size), {
+	if (!Module.g_bqws_pt_sockets || em !== Module.g_bqws_pt_sockets.em_sockets[handle]) {
+		console.error("WebSocket '0x" + em.toString(16) + "' not found in thread: Make sure to call bqws_update() only from a single thread per socket in WASM!");
+		return 0;
+	}
 	var ws = Module.g_bqws_pt_sockets.sockets[handle];
 	if (ws.readyState == 0) {
 		return 0;
@@ -193,21 +293,29 @@ EM_JS(int, pt_em_websocket_send_text, (int handle, const char *data, size_t size
 	return 1;
 });
 
-EM_JS(void, pt_em_websocket_close, (int handle, int code), {
+EM_JS(void, pt_em_websocket_close, (int handle, pt_em_socket *em, int code), {
+	if (!Module.g_bqws_pt_sockets || em !== Module.g_bqws_pt_sockets.em_sockets[handle]) {
+		console.error("WebSocket '0x" + em.toString(16) + "' not found in thread: Make sure to call bqws_update() only from a single thread per socket in WASM!");
+		return 0;
+	}
 	var ws = Module.g_bqws_pt_sockets.sockets[handle];
 	if (ws.readyState >= 2) {
 		return 0;
 	}
 
 	ws.close(code);
+	return 1;
 });
 
-EM_JS(int, pt_em_free_websocket, (int handle), {
+EM_JS(int, pt_em_try_free_websocket, (int handle, pt_em_socket *em), {
+	if (!Module.g_bqws_pt_sockets || em !== Module.g_bqws_pt_sockets.em_sockets[handle]) { return 0; }
 	var ws = Module.g_bqws_pt_sockets.sockets[handle];
 	if (ws.readyState < 2) ws.close();
 
 	Module.g_bqws_pt_sockets.sockets[handle] = null;
+	Module.g_bqws_pt_sockets.em_sockets[handle] = null;
 	Module.g_bqws_pt_sockets.free_list.push(handle);
+	return 1;
 });
 
 static bool pt_send_message(void *user, bqws_socket *ws, bqws_msg *msg)
@@ -263,15 +371,15 @@ static bool pt_send_message(void *user, bqws_socket *ws, bqws_msg *msg)
 	bool ret = true;
 
 	if (type == BQWS_MSG_BINARY) {
-		ret = (bool)pt_em_websocket_send_binary(em->handle, data, size);
+		ret = (bool)pt_em_websocket_send_binary(em->handle, em, data, size);
 	} else if (type == BQWS_MSG_TEXT) {
-		ret = (bool)pt_em_websocket_send_text(em->handle, data, size);
+		ret = (bool)pt_em_websocket_send_text(em->handle, em, data, size);
 	} else if (type == BQWS_MSG_CONTROL_CLOSE) {
 		unsigned code = 1000;
 		if (msg->size >= 2) {
 			code = (unsigned)(uint8_t)msg->data[0] << 8 | (unsigned)(uint8_t)msg->data[1];
 		}
-		pt_em_websocket_close(em->handle, (int)code);
+		pt_em_websocket_close(em->handle, em, (int)code);
 		ret = true;
 	} else {
 		// Don't send control messages
@@ -320,7 +428,7 @@ static void pt_io_init(void *user, bqws_socket *ws)
 		protocols[i] = ptr;
 	}
 
-	int handle = pt_em_connect_websocket(ws, url_str, protocols, em->num_protocols);
+	int handle = pt_em_connect_websocket(em, url_str, protocols, em->num_protocols);
 	em->handle = handle;
 
 	bqws_free(em->connect_data);
@@ -330,6 +438,8 @@ static void pt_io_init(void *user, bqws_socket *ws)
 static void pt_io_close(void *user, bqws_socket *ws)
 {
 	pt_em_socket *em = (pt_em_socket*)user;
+
+	pt_em_mutex_lock(&em->ws_mutex);
 
 	pt_em_partial *next = em->partial_first;
 	while (next) {
@@ -342,12 +452,21 @@ static void pt_io_close(void *user, bqws_socket *ws)
 		bqws_free(em->connect_data);
 	}
 
+	bool do_free = false;
 	if (em->handle >= 0) {
-		pt_em_free_websocket(em->handle);
+		if (pt_em_try_free_websocket(em->handle, em)) {
+			do_free = true;
+		}
+	} else {
+		do_free = true;
 	}
 
-	em->magic = BQWS_PT_DELETED_MAGIC;
-	bqws_free(em);
+	em->ws = NULL;
+	pt_em_mutex_unlock(&em->ws_mutex);
+
+	if (do_free) {
+		pt_em_free(em);
+	}
 }
 
 static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
@@ -414,6 +533,8 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 		}
 	}
 
+	pt_em_mutex_init(&em->ws_mutex);
+	em->ws = ws;
 	em->handle = -1;
 
 	return ws;
