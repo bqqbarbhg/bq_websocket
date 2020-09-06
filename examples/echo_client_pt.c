@@ -20,7 +20,9 @@ size_t num_recv;
 size_t timer;
 size_t counter;
 
-static void log(void *user, bqws_socket *ws, const char *line)
+bool g_verbose = false;
+
+static void client_log(void *user, bqws_socket *ws, const char *line)
 {
 	printf("@@ %s\n", line);
 }
@@ -48,7 +50,7 @@ bool main_loop()
 			counter++;
 			char msg[32];
 			snprintf(msg, sizeof(msg), "%zu", counter);
-			printf("%s...\n", msg);
+			if (g_verbose) printf("%s...\n", msg);
 			bqws_send_text(ws, msg);
 			bqws_update_io_write(ws);
 
@@ -61,7 +63,7 @@ bool main_loop()
 	bqws_msg *msg;
 	while ((msg = bqws_recv(ws)) != NULL) {
 		num_recv++;
-		printf("-> %s\n", msg->data);
+		if (g_verbose) printf("-> %s\n", msg->data);
 		bqws_free_msg(msg);
 	}
 
@@ -81,6 +83,16 @@ bool main_loop()
 
 int main(int argc, char **argv)
 {
+	for (int argi = 1; argi < argc; argi++) {
+		if (!strcmp(argv[argi], "-v")) {
+			g_verbose = true;
+		}
+	}
+
+	#if defined(__EMSCRIPTEN__)
+		g_verbose = true;
+	#endif
+
 	bqws_pt_init_opts init_opts = { 0 };
 	#if !defined(NO_TLS)
 		init_opts.ca_filename = "cacert.pem";
@@ -92,7 +104,9 @@ int main(int argc, char **argv)
 	}
 
 	bqws_opts opts = { 0 };
-	opts.log_fn = &log;
+	if (g_verbose) {
+		opts.log_fn = &client_log;
+	}
 
 	#if !defined(NO_TLS)
 		ws = bqws_pt_connect("wss://echo.websocket.org", NULL, &opts, NULL);
