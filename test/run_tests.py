@@ -14,7 +14,7 @@ root_path = os.path.join(self_path, "..")
 build_path = os.path.join(root_path, "build")
 
 if not os.path.exists(build_path):
-    print("Creating build directory: {}".format(os.path.abspath(build_path)))
+    print("Creating build directory: {}".format(os.path.abspath(build_path)), flush=True)
     os.mkdir(build_path)
 os.chdir(build_path)
 
@@ -27,13 +27,13 @@ class TestExe:
         self.defines = kwargs.get("defines", [])
 
 def extract_tar_gz(name):
-    print("Extracting {}".format(name))
+    print("Extracting {}".format(name), flush=True)
     tar = tarfile.open(name)
     tar.extractall()
     tar.close()
 
 def init_vsvars():
-    print("=== Setting up MSVC variables ===")
+    print("=== Setting up MSVC variables ===", flush=True)
     vswhere_path = r"%ProgramFiles(x86)%/Microsoft Visual Studio/Installer/vswhere.exe"
     vswhere_path = os.path.expandvars(vswhere_path)
     if not os.path.exists(vswhere_path):
@@ -41,7 +41,7 @@ def init_vsvars():
 
     vs_path = os.popen('"{}" -latest -property installationPath'.format(vswhere_path)).read().rstrip()
     vsvars_path = os.path.join(vs_path, "VC\\Auxiliary\\Build\\vcvars64.bat")
-    print(".. Using {}".format(vsvars_path))
+    print(".. Using {}".format(vsvars_path), flush=True)
 
     output = os.popen('"{}" && set'.format(vsvars_path)).read()
     for line in output.splitlines():
@@ -53,12 +53,12 @@ def src_path(path):
     return os.path.relpath(os.path.join(root_path, path)).replace('\\', '/')
 
 def run_cmd(args):
-    print("$ " + " ".join(shlex.quote(a) for a in args))
+    print("$ " + " ".join(shlex.quote(a) for a in args), flush=True)
     subprocess.check_call(args)
 
 def build_exe(exe):
     if not exe.sources: return
-    print("=== Building {} ===".format(exe.name))
+    print("=== Building {} ===".format(exe.name), flush=True)
     if sys.platform == "win32":
         IGNORE_WARNINGS = ["-wd4100", "-wd4702", "-wd4459"]
         CL_FLAGS = ["-MT", "-nologo", "-O2", "-W4", "-WX", "-Zi"]
@@ -86,7 +86,7 @@ def build_exe(exe):
         run_cmd(args)
 
 def run_exe(exe):
-    print("=== Running {} ===".format(exe.desc))
+    print("=== Running {} ===".format(exe.desc), flush=True)
     if sys.platform == "win32":
         args = ["{}.exe".format(exe.name)]
         args += exe.args
@@ -144,4 +144,4 @@ for exe in TEST_EXES:
 for exe in TEST_EXES:
     run_exe(exe)
 
-print("=== All tests passed! ===")
+print("=== All tests passed! ===", flush=True)
