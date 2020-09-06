@@ -12,14 +12,17 @@ script:
     - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DUSE_CASE_FILES -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz/fuzz_client_handshake.c -o fuzz_client_handshake_cases
     - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DUSE_CASE_FILES -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz/fuzz_server_handshake.c -o fuzz_server_handshake_cases
     - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DUSE_CASE_FILES -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz/fuzz_protocol.c -o fuzz_protocol_cases
+    - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz/fuzz_protocol.c ../examples/echo_client_pt.c -o example_echo_client_pt
     - tar -xzf ../test/fuzz/fuzz_test_cases.tar.gz
     - ./test_self_push
     - ./test_self_pull
     - ./fuzz_client_handshake_cases fuzz_test_cases/fuzz_
     - ./fuzz_server_handshake_cases fuzz_test_cases/fuzz_
     - ./fuzz_protocol_cases fuzz_test_cases/fuzz_
-    - llvm-cov gcov bq_websocket
+    - ./example_echo_client_pt
+    - llvm-cov gcov bq_websocket bq_websocket_platform
     - cp bq_websocket.c.gcov ../bq_websocket.c.gcov
+    - cp bq_websocket_platform.c.gcov ../bq_websocket_platform.c.gcov
     - rm *.gcov
 
 after_success:

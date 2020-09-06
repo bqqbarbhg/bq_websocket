@@ -37,14 +37,14 @@ static void log_pt_error()
 	}
 }
 
-void main_loop()
+bool main_loop()
 {
-	if (!ws) return;
+	if (!ws) return true;
 
 	bqws_update(ws);
 
 	if (num_recv >= 3) {
-		if (timer++ % 100 == 0) {
+		if (timer++ % 10 == 0) {
 			counter++;
 			char msg[32];
 			snprintf(msg, sizeof(msg), "%zu", counter);
@@ -75,6 +75,8 @@ void main_loop()
 
 		log_pt_error();
 	}
+
+	return false;
 }
 
 int main(int argc, char **argv)
@@ -119,7 +121,7 @@ int main(int argc, char **argv)
 #else
 	for (;;) {
 		os_sleep();
-		main_loop();
+		if (main_loop()) break;
 	}
 #endif
 
