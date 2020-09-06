@@ -57,7 +57,7 @@ def src_path(path):
 
 def run_cmd(args):
     print("$ " + " ".join(shlex.quote(a) for a in args), flush=True)
-    subprocess.check_call(args, timeout=30)
+    subprocess.check_call(args, timeout=240)
 
 def extract_readme_examples():
     print("=== Extracting README examples ===")
