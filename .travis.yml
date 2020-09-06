@@ -4,15 +4,15 @@ language: cpp
 compiler: clang
 
 script:
-    - python3 misc/verify_mutexes.py
+    - python3 test/verify_mutexes.py
     - mkdir -p build
     - cd build
     - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -D_GNU_SOURCE ../bq_websocket.c ../test/test_self.c -o test_self_push
     - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DTEST_PULL -D_GNU_SOURCE ../bq_websocket.c ../test/test_self.c -o test_self_pull
-    - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DUSE_CASE_FILES -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz_client_handshake.c -o fuzz_client_handshake_cases
-    - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DUSE_CASE_FILES -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz_server_handshake.c -o fuzz_server_handshake_cases
-    - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DUSE_CASE_FILES -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz_protocol.c -o fuzz_protocol_cases
-    - tar -xzf ../test/fuzz_test_cases.tar.gz
+    - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DUSE_CASE_FILES -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz/fuzz_client_handshake.c -o fuzz_client_handshake_cases
+    - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DUSE_CASE_FILES -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz/fuzz_server_handshake.c -o fuzz_server_handshake_cases
+    - clang --coverage -g -std=gnu99 -Wno-unused-value -lpthread -DUSE_CASE_FILES -D_GNU_SOURCE ../bq_websocket.c ../test/fuzz/fuzz_protocol.c -o fuzz_protocol_cases
+    - tar -xzf ../test/fuzz/fuzz_test_cases.tar.gz
     - ./test_self_push
     - ./test_self_pull
     - ./fuzz_client_handshake_cases fuzz_test_cases/fuzz_
