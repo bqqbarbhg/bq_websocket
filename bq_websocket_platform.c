@@ -677,11 +677,14 @@ static void os_imp_parse_address(bqws_pt_address *dst, struct sockaddr *addr)
 static os_socket os_socket_connect(const bqws_url *url, bqws_pt_address *addr)
 {
 	wchar_t whost[256];
-	wchar_t service[32];
+	char service[32];
+	wchar_t wservice[32];
 
-	wsprintfW(service, L"%u", (unsigned)url->port);
+	snprintf(service, sizeof(service), "%u", url->port);
+	int res = MultiByteToWideChar(CP_UTF8, 0, service, -1, wservice, sizeof(wservice) / sizeof(*wservice));
+	if (res == 0) return OS_BAD_SOCKET;
 
-	int res = MultiByteToWideChar(CP_UTF8, 0, url->host, -1, whost, sizeof(whost) / sizeof(*whost));
+	res = MultiByteToWideChar(CP_UTF8, 0, url->host, -1, whost, sizeof(whost) / sizeof(*whost));
 	if (res == 0) return OS_BAD_SOCKET;
 
 	ADDRINFOW hints = { 0 };
@@ -690,7 +693,7 @@ static os_socket os_socket_connect(const bqws_url *url, bqws_pt_address *addr)
 	hints.ai_protocol = IPPROTO_TCP;
 
 	ADDRINFOW *info;
-	res = GetAddrInfoW(whost, service, &hints, &info);
+	res = GetAddrInfoW(whost, wservice, &hints, &info);
 	if (res != 0) {
 		pt_fail_wsa("GetAddrInfoW()");
 		return INVALID_SOCKET;
