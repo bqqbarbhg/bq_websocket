@@ -1708,7 +1708,9 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 
 		// Read from the handshake until we reach the end
 		while (!ws->err && ws->io.handshake_overflow.read_offset < ws->io.handshake_overflow.size) {
-			ws_read_data(ws, &ws_recv_from_handshake_overflow, NULL);
+			if (!ws_read_data(ws, &ws_recv_from_handshake_overflow, NULL)) {
+				return false;
+			}
 		}
 
 		if (ws->err) return false;
