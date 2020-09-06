@@ -1,4 +1,4 @@
- # bq_websocket ![CI](https://github.com/bqqbarbhg/bq_websocket/workflows/CI/badge.svg)
+ # bq_websocket [![CI](https://github.com/bqqbarbhg/bq_websocket/workflows/CI/badge.svg)](https://github.com/bqqbarbhg/bq_websocket/actions)
 
 
 Single source file WebSocket library.
