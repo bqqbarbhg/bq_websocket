@@ -614,11 +614,7 @@ static size_t mem_stream_recv(void *user, bqws_socket *ws, void *data, size_t ma
 // avaialable (which there should almost always be). These functions just call the
 // user callbacks or defaults passing in the user pointer.
 
-static void *allocator_alloc(const bqws_allocator *at, size_t size);
-static void *allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_size, size_t new_size);
-static void allocator_free(const bqws_allocator *at, void *ptr, size_t size);
-
-static void *allocator_alloc(const bqws_allocator *at, size_t size)
+void *bqws_allocator_alloc(const bqws_allocator *at, size_t size)
 {
 	if (at->alloc_fn) {
 		// User defined alloc directly
@@ -632,14 +628,14 @@ static void *allocator_alloc(const bqws_allocator *at, size_t size)
 	}
 }
 
-static void *allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_size, size_t new_size)
+void *bqws_allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_size, size_t new_size)
 {
 	if (old_size == 0) {
 		// Realloc with `old_size==0` is equivalent to malloc
-		return allocator_alloc(at, new_size);
+		return bqws_allocator_alloc(at, new_size);
 	} else if (new_size == 0) {
 		// Realloc with `new_size==0` is equivalent to free
-		allocator_free(at, ptr, old_size);
+		bqws_allocator_free(at, ptr, old_size);
 		return NULL;
 	}
 
@@ -662,7 +658,7 @@ static void *allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_s
 	}
 }
 
-static void allocator_free(const bqws_allocator *at, void *ptr, size_t size)
+void bqws_allocator_free(const bqws_allocator *at, void *ptr, size_t size)
 {
 	if (size == 0) return;
 	bqws_assert(ptr != NULL);
@@ -717,7 +713,7 @@ static void *ws_alloc(bqws_socket *ws, size_t size)
 {
 	if (!ws_add_memory_used(ws, size)) return NULL;
 
-	void *ptr = allocator_alloc(&ws->allocator, size);
+	void *ptr = bqws_allocator_alloc(&ws->allocator, size);
 	if (!ptr) ws_fail(ws, BQWS_ERR_ALLOCATOR);
 
 	return ptr;
@@ -728,7 +724,7 @@ static void *ws_realloc(bqws_socket *ws, void *ptr, size_t old_size, size_t new_
 	if (!ws_add_memory_used(ws, new_size)) return NULL;
 	ws_remove_memory_used(ws, old_size);
 
-	void *new_ptr = allocator_realloc(&ws->allocator, ptr, old_size, new_size);
+	void *new_ptr = bqws_allocator_realloc(&ws->allocator, ptr, old_size, new_size);
 	if (!new_ptr) ws_fail(ws, BQWS_ERR_ALLOCATOR);
 
 	return new_ptr;
@@ -737,7 +733,7 @@ static void *ws_realloc(bqws_socket *ws, void *ptr, size_t old_size, size_t new_
 static void ws_free(bqws_socket *ws, void *ptr, size_t size)
 {
 	ws_remove_memory_used(ws, size);
-	allocator_free(&ws->allocator, ptr, size);
+	bqws_allocator_free(&ws->allocator, ptr, size);
 }
 
 static char *ws_copy_str(bqws_socket *ws, const char *str)
@@ -828,7 +824,7 @@ static void msg_free_owned(bqws_socket *ws, bqws_msg_imp *msg)
 		ws_remove_memory_used(ws, size);
 
 		bqws_allocator at = msg->allocator;
-		allocator_free(&at, msg, size);
+		bqws_allocator_free(&at, msg, size);
 	}
 }
 
@@ -2371,7 +2367,7 @@ static bqws_socket *ws_new_socket(const bqws_opts *opts, bool is_server)
 		opts = &null_opts;
 	}
 
-	bqws_socket *ws = (bqws_socket*)allocator_alloc(&opts->allocator, sizeof(bqws_socket) + opts->user_size);
+	bqws_socket *ws = (bqws_socket*)bqws_allocator_alloc(&opts->allocator, sizeof(bqws_socket) + opts->user_size);
 	if (!ws) return NULL;
 
 	memset(ws, 0, sizeof(bqws_socket));
@@ -2652,7 +2648,7 @@ void bqws_free_socket(bqws_socket *ws)
 	ws->magic = BQWS_DELETED_MAGIC;
 
 	bqws_allocator at = ws->allocator;
-	allocator_free(&at, ws, sizeof(bqws_socket) + ws->user_size);
+	bqws_allocator_free(&at, ws, sizeof(bqws_socket) + ws->user_size);
 }
 
 bqws_client_opts *bqws_server_get_client_opts(bqws_socket *ws)
@@ -2861,7 +2857,7 @@ void bqws_free_msg(bqws_msg *msg)
 	imp->magic = BQWS_DELETED_MAGIC;
 
 	bqws_allocator at = imp->allocator;
-	allocator_free(&at, imp, msg_alloc_size(msg));
+	bqws_allocator_free(&at, imp, msg_alloc_size(msg));
 }
 
 void bqws_send(bqws_socket *ws, bqws_msg_type type, const void *data, size_t size)
