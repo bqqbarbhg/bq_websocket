@@ -19,6 +19,19 @@ int main(int argc, char **argv)
     bqws_opts opts = { 0 };
     opts.skip_handshake = true;
 
+#ifdef USE_CASE_FILES
+	FILE *f = NULL;
+	for (uint32_t i = 0; ; i++) {
+		char buf[1024];
+		snprintf(buf, sizeof(buf), "%s%06u.bin", argv[1], i);
+		if (f) fclose(f);
+		f = fopen(buf, "rb");
+		if (!f) {
+			printf("Success! Tested %u cases\n", i);
+			return 0;
+		}
+		size_t size = fread(g_buffer, 1, sizeof(g_buffer), f);
+#else
 	#ifndef _MSC_VER
 	while (__AFL_LOOP(10000)) {
 		size_t size = (size_t)read(0, g_buffer, sizeof(g_buffer));
@@ -27,6 +40,7 @@ int main(int argc, char **argv)
 		_setmode(_fileno(stdin), O_BINARY);
 		size_t size = fread(g_buffer, 1, sizeof(g_buffer), stdin);
 	#endif
+#endif
 
 		{
 			bqws_socket *ws = bqws_new_client(&opts, NULL);
