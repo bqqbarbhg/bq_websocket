@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 set -eux
 
 python3 test/verify_mutexes.py
