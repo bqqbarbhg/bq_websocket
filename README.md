@@ -20,6 +20,7 @@ The library is dual licensed under **public domain** and **MIT**, you can choose
 #include "bq_websocket.h"
 #include "bq_websocket_platform.h"
 #include <time.h> // For sleep()
+#include <stdio.h> // For printf()
 
 int main()
 {
@@ -32,8 +33,11 @@ int main()
         bqws_update(ws);
         bqws_msg *msg = bqws_recv(ws);
         if (msg) {
-            assert(msg->type == BQWS_MSG_TEXT);
-            printf("Received message: %s\n", msg->data);
+            if (msg->type == BQWS_MSG_TEXT) {
+                printf("Received message: %s\n", msg->data);
+            } else if (msg->type == BQWS_MSG_BINARY) {
+                printf("Received binary message: %zu bytes\n", msg->size);
+            }
             bqws_free_msg(msg);
             break;
         }
