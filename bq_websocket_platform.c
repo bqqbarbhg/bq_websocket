@@ -851,9 +851,9 @@ static void pt_fail_posix(const char *func)
 static void pt_sleep_ms(uint32_t ms)
 {
 	struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000;
-    while (nanosleep(&ts, &ts)) { }
+	ts.tv_sec = ms / 1000;
+	ts.tv_nsec = (ms % 1000) * 1000000;
+	while (nanosleep(&ts, &ts)) { }
 }
 
 static bool os_init(const bqws_pt_init_opts *opts)
