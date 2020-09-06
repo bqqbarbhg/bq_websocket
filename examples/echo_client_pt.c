@@ -82,7 +82,9 @@ bool main_loop()
 int main(int argc, char **argv)
 {
 	bqws_pt_init_opts init_opts = { 0 };
-	init_opts.ca_filename = "cacert.pem";
+	#if !defined(NO_TLS)
+		init_opts.ca_filename = "cacert.pem";
+	#endif
 	if (!bqws_pt_init(&init_opts)) {
 		fprintf(stderr, "bqws_pt_init() failed\n");
 		log_pt_error();
@@ -92,7 +94,12 @@ int main(int argc, char **argv)
 	bqws_opts opts = { 0 };
 	opts.log_fn = &log;
 
-	ws = bqws_pt_connect("wss://echo.websocket.org", NULL, &opts, NULL);
+	#if !defined(NO_TLS)
+		ws = bqws_pt_connect("wss://echo.websocket.org", NULL, &opts, NULL);
+	#else
+		ws = bqws_pt_connect("ws://echo.websocket.org", NULL, &opts, NULL);
+	#endif
+
 	if (!ws) {
 		fprintf(stderr, "bqws_pt_connect() failed\n");
 		log_pt_error();
