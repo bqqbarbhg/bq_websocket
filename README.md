@@ -22,6 +22,7 @@ The library is dual licensed under **public domain** and **MIT**, you can choose
 
 int main()
 {
+    bqws_pt_init(NULL);
     bqws_socket *ws = bqws_pt_connect("ws://echo.websocket.org", NULL, NULL, NULL);
     bqws_send_text(ws, "Hello world!");
 
@@ -39,6 +40,7 @@ int main()
     }
 
     bqws_free_socket(ws);
+    bqws_pt_shutdown();
 }
 ```
 
