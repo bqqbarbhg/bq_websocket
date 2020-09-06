@@ -39,9 +39,11 @@ static void log_pt_error()
 	}
 }
 
-bool main_loop()
+void main_loop()
 {
-	if (!ws) return true;
+	if (!ws) {
+		exit(0);
+	}
 
 	bqws_update(ws);
 
@@ -77,8 +79,6 @@ bool main_loop()
 
 		log_pt_error();
 	}
-
-	return false;
 }
 
 int main(int argc, char **argv)
@@ -142,7 +142,7 @@ int main(int argc, char **argv)
 #else
 	for (;;) {
 		os_sleep();
-		if (main_loop()) break;
+		main_loop();
 	}
 #endif
 

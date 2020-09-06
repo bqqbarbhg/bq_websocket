@@ -10,6 +10,8 @@ import re
 import shutil
 
 verbose = "-v" in sys.argv
+emscripten = "--emscripten" in sys.argv
+no_gcc = "--no-gcc" in sys.argv
 
 self_path = os.path.dirname(os.path.abspath(__file__))
 root_path = os.path.join(self_path, "..")
@@ -28,6 +30,7 @@ class TestExe:
         self.sources = kwargs.get("sources", [])
         self.defines = kwargs.get("defines", [])
         self.use_network = kwargs.get("use_network", False)
+        self.use_asyncify = kwargs.get("use_asyncify", False)
 
 def extract_tar_gz(name):
     print("Extracting {}".format(name), flush=True)
@@ -94,6 +97,12 @@ def copy_cpp_files():
     shutil.copyfile("../bq_websocket_platform.h", "bq_websocket_platform.h")
     shutil.copyfile("readme_client_usage.c", "readme_client_usage.cpp")
 
+def setup_node_env():
+    print("=== Setting up Node.js environment ===")
+    if not os.path.exists("package.json"):
+        run_cmd(["npm", "init", "-y"])
+    run_cmd(["npm", "install", "ws", "-y"])
+
 def build_exe(exe):
     if not exe.sources: return
     print("=== Building {} ===".format(exe.name), flush=True)
@@ -117,7 +126,12 @@ def build_exe(exe):
         CC_FLAGS = ["-g", "-O2", "-DGNU_SOURCE", "-Wall"]
         LD_FLAGS = ["-lpthread"]
 
-        ccs = ["gcc", "clang"]
+        if emscripten:
+            ccs = ["emcc"]
+        elif no_gcc:
+            ccs = ["clang"]
+        else:
+            ccs = ["gcc", "clang"]
 
         for cc in ccs:
             args = [cc]
@@ -131,15 +145,31 @@ def build_exe(exe):
             args += ("-D" + d for d in exe.defines)
             args += ["-I.."]
             args += LD_FLAGS
+            if emscripten:
+                args += ["-s", "NODERAWFS=1"]
+            if emscripten and exe.use_asyncify:
+                args += ["-s", "ASYNCIFY"]
             if sys.platform == "darwin" and exe.use_network:
                 args += ["-framework", "CoreFoundation"]
                 args += ["-framework", "CFNetwork"]
-            args += ["-o", exe.name]
+            if emscripten:
+                args += ["-o", exe.name + ".js"]
+            else:
+                args += ["-o", exe.name]
             run_cmd(args)
 
 def run_exe(exe):
     print("=== Running {} ===".format(exe.desc), flush=True)
-    if sys.platform == "win32":
+    if emscripten:
+        # TODO: Asyncify can't call C functions ?!?!
+        if exe.use_asyncify:
+            print("TODO: Skipped, cannot call C if using -S ASYNCIFY (?)")
+            return
+        args = ["node", exe.name]
+        args += exe.args
+        if verbose: args += ["-v"]
+        run_cmd(args)
+    elif sys.platform == "win32":
         args = ["{}.exe".format(exe.name)]
         args += exe.args
         if verbose: args += ["-v"]
@@ -189,18 +219,22 @@ TEST_EXES = [
         name="readme_client_usage",
         sources=["bq_websocket.c", "bq_websocket_platform.c", "build/readme_client_usage.c"],
         use_network=True,
+        use_asyncify=True,
     ),
     TestExe(
         name="readme_client_usage",
         desc="readme_client_usage (C++)",
         sources=["build/bq_websocket.cpp", "build/bq_websocket_platform.cpp", "build/readme_client_usage.cpp"],
         use_network=True,
+        use_asyncify=True,
     ),
 ]
 
 extract_tar_gz("../test/fuzz/fuzz_test_cases.tar.gz")
 extract_readme_examples()
 copy_cpp_files()
+if emscripten:
+    setup_node_env()
 
 if sys.platform == "win32":
     init_vsvars()

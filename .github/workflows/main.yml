@@ -32,5 +32,17 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - name: Run tests
-        run: python3 test/run_tests.py
+        run: python3 test/run_tests.py --no-gcc
+
+  ci_emscripten:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup emsdk
+        uses: mymindstorm/setup-emsdk@v6
+        with:
+          version: 2.0.0
+          actions-cache-folder: 'emsdk-cache'
+      - name: Run tests
+        run: python3 test/run_tests.py --emscripten
 
