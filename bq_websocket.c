@@ -491,7 +491,6 @@ static void ws_close(bqws_socket *ws)
 
 static void ws_fail(bqws_socket *ws, bqws_error err)
 {
-	bool should_close = false;
 	bool should_report = false;
 
 	bqws_mutex_lock(&ws->state.mutex);
@@ -1001,9 +1000,9 @@ static void hs_push_size(bqws_socket *ws, const char *data, size_t size)
 			return;
 		}
 
-		char *data = ws_realloc(ws, ws->io.handshake.data,	 ws->io.handshake.capacity, new_cap);
-		if (!data) return;
-		ws->io.handshake.data = data;
+		char *new_data = ws_realloc(ws, ws->io.handshake.data, ws->io.handshake.capacity, new_cap);
+		if (!new_data) return;
+		ws->io.handshake.data = new_data;
 		ws->io.handshake.capacity = new_cap;
 	}
 
@@ -1219,8 +1218,8 @@ static bool streq_ic(const char *sa, const char *sb)
 {
 	for (;;) {
 		char a = *sa++, b = *sb++;
-		if ((unsigned)(unsigned char)a < 0x80u) a = tolower(a);
-		if ((unsigned)(unsigned char)b < 0x80u) b = tolower(b);
+		if ((unsigned)(unsigned char)a < 0x80u) a = (char)tolower(a);
+		if ((unsigned)(unsigned char)b < 0x80u) b = (char)tolower(b);
 		if (a != b) return false;
 		if (a == 0) return true;
 	}
@@ -1343,7 +1342,6 @@ static bool hs_parse_server_handshake(bqws_socket *ws)
 		header.name = hs_parse_token(ws, &pos, ':');
 		hs_skip_space(ws, &pos);
 
-		size_t value_pos = pos;
 		header.value = hs_parse_token(ws, &pos, '\r');
 		if (!header.name || !header.value) return false;
 		if (!hs_parse_literal(ws, &pos, "\n")) return false;
@@ -1448,8 +1446,6 @@ static void ws_enqueue_send(bqws_socket *ws, bqws_msg_imp *msg)
 
 static void ws_enqueue_recv(bqws_socket *ws, bqws_msg_imp *msg)
 {
-	size_t msg_memory_size = msg_alloc_size(&msg->msg);
-
 	// If the user callback returns true the message won't be
 	// enqueued to the receive queue.
 	if (ws->message_fn) {
@@ -1835,7 +1831,7 @@ static bool ws_read_data(bqws_socket *ws, bqws_io_recv_fn recv_fn, void *user)
 			h += 4;
 		}
 
-		bqws_assert((const char*)h - ws->io.recv_header == buf->header_size);
+		bqws_assert((size_t)((const char*)h - ws->io.recv_header) == buf->header_size);
 
 		bqws_msg_type type = BQWS_MSG_INVALID;
 

@@ -18,17 +18,28 @@ static size_t pull_recv(void *user, bqws_socket *ws, void *data, size_t max_size
 
 int main(int argc, char **argv)
 {
+	bool verbose = false;
+	bool pull = false;
+	for (int argi = 1; argi < argc; argi++) {
+		if (!strcmp(argv[argi], "-v")) {
+			verbose = true;
+		} else if (!strcmp(argv[argi], "--pull")) {
+			pull = true;
+		}
+	}
+
 	bqws_opts shared_opts = { 0 };
-#ifdef TEST_PULL
-	shared_opts.io.recv_fn = &pull_recv;
-#else
-	shared_opts.io.send_fn = &push_send;
-#endif
-	shared_opts.log_fn = &test_log_fn;
+	if (pull) {
+		shared_opts.io.recv_fn = &pull_recv;
+	} else {
+		shared_opts.io.send_fn = &push_send;
+	}
+	if (verbose) {
+		shared_opts.log_fn = &test_log_fn;
+		printf("  Client                                    Server\n");
+	}
 	shared_opts.log_send = true;
 	shared_opts.log_recv = true;
-
-	printf("  Client                                    Server\n");
 
 	{
 		bqws_opts opts = shared_opts;
