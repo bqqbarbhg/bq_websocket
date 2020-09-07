@@ -179,7 +179,7 @@ def build_exe(exe):
     else:
         IGNORE_WARNINGS = ["-Wno-unused-value"]
         is_cpp = any(s.endswith(".cpp") for s in exe.sources)
-        CC_FLAGS = ["-g", "-O2", "-DGNU_SOURCE", "-Wall"]
+        CC_FLAGS = ["-g", "-O2", "-Wall"]
 
         if emscripten:
             ccs = ["emcc"]

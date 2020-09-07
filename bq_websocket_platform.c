@@ -1999,17 +1999,15 @@ void bqws_pt_get_error_desc(char *dst, size_t size, const bqws_pt_error *err)
 		{
 		#if defined(_WIN32)
 			strerror_s(dst, size, (int)err->data);
-		#elif defined(_GNU_SOURCE)
-			const char *err_str = strerror_r((int)err->data, dst, size);
-			if (err_str != dst) {
+		#else
+			const char *ptr = (const char*)(uintptr_t)strerror_r((int)err->data, dst, size);
+			if (dst[0] == '\0' && ptr != dst) {
+				const char *err_str = strerror((int)err->data);
 				size_t len = strlen(err_str);
 				if (len >= size - 1) len = size - 1;
 				memcpy(dst, err_str, len);
 				dst[len] = '\0';
 			}
-		#else
-			dst[0] = '\0';
-			(void)strerror_r((int)err->data, dst, size);
 		#endif
 		}
 		break;
