@@ -1,0 +1,17 @@
+@@ State: OPEN (skip handhake)
+@@ Override state: CONNECTING
+@@ Override state: OPEN
+-> Hello world!
+-> Test
+-> MultiPartMessage
+1...
+-> 1
+2...
+-> 2
+3...
+-> 3
+4...
+-> 4
+5...
+@@ Override state: CLOSED
+@@ Freed
