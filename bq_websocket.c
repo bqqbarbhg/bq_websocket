@@ -2896,7 +2896,7 @@ bqws_msg *bqws_allocate_msg(bqws_socket *ws, bqws_msg_type type, size_t size)
 void bqws_send_msg(bqws_socket *ws, bqws_msg *msg)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	bqws_assert(msg && msg->type == BQWS_MSG_TEXT || msg->type == BQWS_MSG_BINARY);
+	bqws_assert(msg && (msg->type == BQWS_MSG_TEXT || msg->type == BQWS_MSG_BINARY));
 	bqws_assert(msg->size <= msg->capacity);
 
 	bqws_msg_imp *imp = msg_imp(msg);
