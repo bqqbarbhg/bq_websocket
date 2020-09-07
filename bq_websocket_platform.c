@@ -1415,7 +1415,6 @@ static bool cf_connect(const bqws_url *url, pt_cf *cf)
 static void cf_get_address(pt_cf *cf, bqws_pt_address *address)
 {
     if (!cf->has_address) {
-        cf->has_address = true;
         
         CFDataRef socket_data = (CFDataRef)CFWriteStreamCopyProperty(cf->write, kCFStreamPropertySocketNativeHandle);
         if (socket_data) {
@@ -1431,6 +1430,8 @@ static void cf_get_address(pt_cf *cf, bqws_pt_address *address)
             }
             CFRelease(socket_data);
         }
+
+        cf->has_address = true;
     }
 }
 
