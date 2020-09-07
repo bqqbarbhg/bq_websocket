@@ -92,7 +92,8 @@ def start_server():
     args += ["-l", str(local_file_server_port)]
     print("$ " + " ".join(shlex.quote(a) for a in args) + " &", flush=True)
     null = open(os.devnull, "w")
-    server_process = subprocess.Popen(args, shell=True, stdout=null)
+    shell = sys.platform == "win32"
+    server_process = subprocess.Popen(args, shell=shell, stdout=null)
 
 def check_server():
     print("=== Checking connection to local file server (port {}) ===".format(local_file_server_port))
@@ -111,7 +112,8 @@ def src_path(path):
 
 def run_cmd(args):
     print("$ " + " ".join(shlex.quote(a) for a in args), flush=True)
-    subprocess.check_call(args, shell=True, timeout=240)
+    shell = sys.platform == "win32"
+    subprocess.check_call(args, shell=shell, timeout=240)
 
 def extract_readme_examples():
     print("=== Extracting README examples ===")
