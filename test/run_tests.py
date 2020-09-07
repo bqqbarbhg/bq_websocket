@@ -326,9 +326,6 @@ def run_main():
             print("{:<25} {}".format(exe.desc + ":", exe.help))
         return
 
-    if emscripten:
-        start_server()
-
     if not argv.skip_install:
         extract_tar_gz("../test/fuzz/fuzz_test_cases.tar.gz")
         extract_readme_examples()
@@ -336,6 +333,9 @@ def run_main():
 
     if emscripten and not argv.skip_install:
         setup_node_env()
+
+    if emscripten:
+        start_server()
 
     if sys.platform == "win32" and not emscripten:
         init_vsvars()
