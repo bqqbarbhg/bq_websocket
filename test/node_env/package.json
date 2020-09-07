@@ -1,0 +1,30 @@
+{
+  "name": "bq_websocket_test",
+  "version": "1.0.0",
+  "description": "Test environment for bq_websocket",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bqqbarbhg/bq_websocket.git"
+  },
+  "keywords": [
+    "websocket",
+    "c"
+  ],
+  "author": "bqqbarbhg",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/bqqbarbhg/bq_websocket/issues"
+  },
+  "homepage": "https://github.com/bqqbarbhg/bq_websocket#readme",
+  "dependencies": {
+    "bufferutil": "^4.0.1",
+    "puppeteer": "^5.2.1",
+    "serve": "^11.3.2",
+    "utf-8-validate": "^5.0.2",
+    "ws": "^7.3.1"
+  }
+}
