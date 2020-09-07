@@ -24,16 +24,14 @@ setTimeout(() => {
   const lines = logData.split("\n").map(s => s.trim()).filter(s => s.length > 0)
   let lineIx = 0
 
-  page.on("console", msg => {
+  page.on("console", async (msg) => {
     const text = msg.text();
     if (lineIx < lines.length && lines[lineIx] == text) {
       lineIx += 1;
       console.log(text + `  (match ${lineIx}/${lines.length})`);
       if (lineIx == lines.length) {
-        (async () => {
-          await browser.close();
-          await process.exit(0);
-        })();
+        await browser.close();
+        await process.exit(0);
       }
     } else {
       console.log(text);
@@ -43,7 +41,7 @@ setTimeout(() => {
   const url = `http://localhost:${port}/${path}`
   console.log(`Navigating to: ${url}`)
   await page.goto(url);
- 
+
 })().catch(err => {
   console.error(err);
   process.exit(1);
