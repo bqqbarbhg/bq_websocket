@@ -82,11 +82,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #endif
 
 #ifndef bqws_realloc
-#define bqws_realloc(ptr, size) realloc((ptr), (size))
+#define bqws_realloc(ptr, old_size, new_size) realloc((ptr), (new_size))
 #endif
 
 #ifndef bqws_free
-#define bqws_free(ptr) free((ptr))
+#define bqws_free(ptr, size) free((ptr))
 #endif
 
 // TODO: QueryPerformanceCounter() or clock_gettime() might be faster
@@ -695,7 +695,7 @@ void *bqws_allocator_realloc(const bqws_allocator *at, void *ptr, size_t old_siz
 		return new_ptr;
 	} else {
 		// Default: realloc()
-		return bqws_realloc(ptr, new_size);
+		return bqws_realloc(ptr, old_size, new_size);
 	}
 }
 
@@ -714,7 +714,7 @@ void bqws_allocator_free(const bqws_allocator *at, void *ptr, size_t size)
 		bqws_assert(at->alloc_fn == NULL);
 
 		// Default: free(), only if there is no user defined allocator
-		bqws_free(ptr);
+		bqws_free(ptr, size);
 	}
 }
 
