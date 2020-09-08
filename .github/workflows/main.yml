@@ -6,9 +6,13 @@ name: CI
 # events but only for the master branch
 on:
   push:
-    branches: [ master, develop ]
+    branches: [ master ]
   pull_request:
-    branches: [ master, develop ]
+    branches: [ master ]
+
+env:
+  EM_VERSION: 2.0.0
+  EM_CACHE_FOLDER: 'emsdk-cache'
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
@@ -38,11 +42,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+      - name: Setup cache
+        id: cache-system-libraries
+        uses: actions/cache@v2
+        with:
+          path: ${{env.EM_CACHE_FOLDER}}
+          key: ${{env.EM_VERSION}}-${{ runner.os }}
       - name: Setup emsdk
         uses: mymindstorm/setup-emsdk@v6
         with:
-          version: 2.0.0
-          actions-cache-folder: 'emsdk-cache'
+          version: ${{env.EM_VERSION}}
+          actions-cache-folder: ${{env.EM_CACHE_FOLDER}}
       - name: Run tests
         run: python3 test/run_tests.py --emscripten
 
