@@ -58,8 +58,8 @@ Alternatively you can include the implementation files as (either C or C++) head
 // Override the default/platform allocators, you don't need to do this at compile-time
 // if you supply custom allocators using the bqws_opts struct!
 #define bqws_malloc(size) my_alloc(size)
-#define bqws_realloc(ptr, size) my_realloc(ptr, size)
-#define bqws_free(ptr) my_free(ptr)
+#define bqws_realloc(ptr, old_size, new_size) my_realloc(ptr, old_size, new_size)
+#define bqws_free(ptr, size) my_free(ptr, size)
 
 // Custom assert and force-enable debug
 #define bqws_assert(cond) my_assert(cond)
