@@ -3224,7 +3224,12 @@ void bqws_update_io_write(bqws_socket *ws)
 			}
 		}
 
-		if (ws->user_io.flush_fn) {
+		// Re-check if we should stop write if the socket got closed
+		bqws_mutex_lock(&ws->state.mutex);
+		do_write = !ws->state.stop_write;
+		bqws_mutex_unlock(&ws->state.mutex);
+
+		if (ws->user_io.flush_fn && do_write) {
 			if (!ws->user_io.flush_fn(ws->user_io.user, ws)) {
 				ws_fail(ws, BQWS_ERR_IO_WRITE);
 			}
