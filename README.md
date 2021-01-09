@@ -97,6 +97,7 @@ int main()
                 } else {
                     bqws_close(ws, BQWS_CLOSE_GENERIC_ERROR, NULL, 0);
                 }
+                bqws_free_msg(msg);
             }
 
             if (bqws_is_closed(ws)) {
