@@ -2629,6 +2629,7 @@ void bqws_queue_close(bqws_socket *ws, bqws_close_reason reason, const void *dat
 
 void bqws_free_socket(bqws_socket *ws)
 {
+	if (!ws) return;
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 
 	ws_log(ws, "Freed");
