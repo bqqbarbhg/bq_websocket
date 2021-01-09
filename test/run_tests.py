@@ -55,6 +55,8 @@ class TestExe:
         self.use_asyncify = kwargs.get("use_asyncify", False)
         self.html_test = kwargs.get("html_test", None)
         self.html_args = kwargs.get("html_args", [])
+        self.skip_run = kwargs.get("skip_run", False)
+        self.skip_emscripten = kwargs.get("skip_emscripten", False)
         self.help = kwargs.get("help", "")
 
 def extract_tar_gz(name):
@@ -161,6 +163,7 @@ def setup_node_env():
 
 def build_exe(exe):
     if not exe.sources: return
+    if emscripten and exe.skip_emscripten: return
     print("=== Building {} ===".format(exe.name), flush=True)
     if sys.platform == "win32" and not emscripten:
         IGNORE_WARNINGS = ["-wd4100", "-wd4702", "-wd4459"]
@@ -224,6 +227,7 @@ def build_exe(exe):
             run_cmd(args)
 
 def run_exe(exe):
+    if exe.skip_run: return
     print("=== Running {} ===".format(exe.desc), flush=True)
     if emscripten:
         if exe.use_asyncify:
@@ -317,6 +321,15 @@ TEST_EXES = [
         sources=["build/bq_websocket.cpp", "build/bq_websocket_platform.cpp", "build/readme_client_usage.cpp"],
         use_network=True,
         use_asyncify=True,
+    ),
+    TestExe(
+        name="readme_server_usage",
+        help="Use the server example embedded in README.md",
+        sources=["bq_websocket.c", "bq_websocket_platform.c", "build/readme_server_usage.c"],
+        use_network=True,
+        use_asyncify=True,
+        skip_run=True,
+        skip_emscripten=True,
     ),
 ]
 
