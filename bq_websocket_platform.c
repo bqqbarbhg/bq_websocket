@@ -1910,7 +1910,14 @@ bqws_socket *bqws_pt_accept(bqws_pt_server *sv, const bqws_opts *opts, const bqw
 {
 	bqws_pt_clear_error();
 
-	return pt_accept(sv, opts, server_opts);
+	bqws_opts opt;
+	if (opts) {
+		opt = *opts;
+	} else {
+		memset(&opt, 0, sizeof(opt));
+	}
+
+	return pt_accept(sv, &opt, server_opts);
 }
 
 bqws_pt_address bqws_pt_get_address(const bqws_socket *ws)

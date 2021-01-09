@@ -2629,6 +2629,7 @@ void bqws_queue_close(bqws_socket *ws, bqws_close_reason reason, const void *dat
 
 void bqws_free_socket(bqws_socket *ws)
 {
+	if (!ws) return;
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
 
 	ws_log(ws, "Freed");
@@ -3056,7 +3057,6 @@ void bqws_send_pong(bqws_socket *ws, const void *data, size_t size)
 void bqws_update(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	if (ws->err) return;
 
 	bqws_update_state(ws);
 	bqws_update_io(ws);
@@ -3065,7 +3065,6 @@ void bqws_update(bqws_socket *ws)
 void bqws_update_state(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	if (ws->err) return;
 
 	bqws_mutex_lock(&ws->state.mutex);
 	bqws_state state = ws->state.state;
@@ -3156,7 +3155,6 @@ void bqws_update_io(bqws_socket *ws)
 void bqws_update_io_read(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	if (ws->err) return;
 
 	bool do_read = true;
 
@@ -3194,7 +3192,6 @@ void bqws_update_io_read(bqws_socket *ws)
 void bqws_update_io_write(bqws_socket *ws)
 {
 	bqws_assert(ws && ws->magic == BQWS_SOCKET_MAGIC);
-	if (ws->err) return;
 
 	bool do_write = true;
 

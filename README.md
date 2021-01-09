@@ -49,6 +49,71 @@ int main()
 }
 ```
 
+### Server (using bq_websocket_platform.h)
+
+[//]: # (example readme_server_usage.c)
+```c
+#include "bq_websocket.h"
+#include "bq_websocket_platform.h"
+#include <stddef.h> // For size_t, NULL
+#include <stdio.h> // For printf()
+#include <string.h> // For strcmp()
+
+#define MAX_CLIENTS 128
+bqws_socket *clients[MAX_CLIENTS];
+
+int main()
+{
+    bqws_pt_init(NULL);
+    bqws_pt_server *sv = bqws_pt_listen(NULL);
+
+    // bq_websocket_platform.h uses non-blocking IO so we need to poll here
+    for (;;) {
+
+        // Accept new connections
+        bqws_socket *new_ws = bqws_pt_accept(sv, NULL, NULL);
+        if (new_ws) {
+            for (size_t i = 0; i < MAX_CLIENTS; i++) {
+                if (!clients[i]) {
+                    bqws_server_accept(new_ws, NULL);
+                    clients[i] = new_ws;
+                    new_ws = NULL; // Found slot, don't delete below
+                    break;
+                }
+            }
+            bqws_free_socket(new_ws);
+        }
+
+        // Update existing clients
+        for (size_t i = 0; i < MAX_CLIENTS; i++) {
+            bqws_socket *ws = clients[i];
+            if (!ws) continue;
+
+            bqws_update(ws);
+            bqws_msg *msg;
+            while ((msg = bqws_recv(ws)) != NULL) {
+                if (msg->type == BQWS_MSG_TEXT && !strcmp(msg->data, "PING")) {
+                    bqws_send_text(ws, "PONG");
+                } else {
+                    bqws_close(ws, BQWS_CLOSE_GENERIC_ERROR, NULL, 0);
+                }
+            }
+
+            if (bqws_is_closed(ws)) {
+                // Free the socket and slot
+                bqws_free_socket(ws);
+                clients[i] = NULL;
+            }
+        }
+
+        bqws_pt_sleep_ms(10);
+    }
+
+    bqws_pt_free_server(sv);
+    bqws_pt_shutdown();
+}
+```
+
 ## Integration
 
 All you need to do is to add bq_websocket.c/h (and optionally bq_websocket_platform.c/h) to your build.
